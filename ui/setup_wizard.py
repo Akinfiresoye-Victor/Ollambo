@@ -1,0 +1,296 @@
+"""
+First-run setup wizard.
+
+Shows three checks (installed → server → models), offers auto-install or
+manual steps, and lets the user pick & pull a model.  When all checks pass,
+emits setup_complete so the main window can switch to the chat page.
+"""
+
+from __future__ import annotations
+
+from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtWidgets import (
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from core.installer import InstallPlan, get_install_plan
+from core.setup_checker import SUGGESTED_MODELS
+from ui.terminal_widget import TerminalWidget
+from workers.install_worker import InstallWorker
+from workers.pull_worker import PullWorker
+from workers.setup_worker import SetupWorker
+
+# Status icons (plain text — no emoji issues on older terminals).
+_CHECKING = "⏳"
+_OK = "✅"
+_FAIL = "❌"
+
+
+class SetupWizard(QWidget):
+    """Step-by-step setup checks with install/pull support."""
+
+    # Emitted when all checks pass.
+    #   (installed_models: list[str], server_started_by_us: bool)
+    setup_complete = Signal(list, bool)
+
+    def __init__(self, ollama_url: str, parent=None) -> None:
+        super().__init__(parent)
+        self._ollama_url = ollama_url
+        self._setup_worker: SetupWorker | None = None
+        self._install_worker: InstallWorker | None = None
+        self._pull_worker: PullWorker | None = None
+        self._server_started_by_us = False
+
+        self._build_ui()
+
+    # ── UI layout ─────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+
+        hdr = QHBoxLayout()
+        hdr.setSpacing(12)
+        from core.assets import get_app_pixmap
+        if not (pix := get_app_pixmap(44)).isNull():
+            lbl = QLabel()
+            lbl.setPixmap(pix)
+            hdr.addWidget(lbl)
+        t_box = QVBoxLayout()
+        t_box.setSpacing(2)
+        title = QLabel("Setting up Ollambo")
+        title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        subtitle = QLabel("Checking your system…")
+        subtitle.setStyleSheet("color: #888;")
+        t_box.addWidget(title)
+        t_box.addWidget(subtitle)
+        hdr.addLayout(t_box)
+        hdr.addStretch()
+        layout.addLayout(hdr)
+
+        # ── Check status lines ────────────────────────────────────────
+        self._lbl_installed = QLabel(f"{_CHECKING} Ollama installed — checking…")
+        self._lbl_server = QLabel(f"{_CHECKING} Ollama server — waiting…")
+        self._lbl_models = QLabel(f"{_CHECKING} Models available — waiting…")
+        for lbl in (self._lbl_installed, self._lbl_server, self._lbl_models):
+            lbl.setStyleSheet("font-size: 14px; padding: 2px 0;")
+            layout.addWidget(lbl)
+
+        # ── Install section (hidden by default) ───────────────────────
+        self._install_section = QWidget()
+        install_layout = QVBoxLayout(self._install_section)
+        install_layout.setContentsMargins(0, 8, 0, 0)
+
+        self._manual_steps = QTextEdit()
+        self._manual_steps.setReadOnly(True)
+        self._manual_steps.setMaximumHeight(120)
+        self._manual_steps.setStyleSheet("background: #2a2a2a; color: #ccc; border: 1px solid #444; padding: 6px;")
+        install_layout.addWidget(self._manual_steps)
+
+        self._btn_install = QPushButton("Install Ollama for me")
+        self._btn_install.clicked.connect(self._on_install_clicked)
+        install_layout.addWidget(self._btn_install)
+
+        self._install_section.setVisible(False)
+        layout.addWidget(self._install_section)
+
+        # ── Terminal (for install output) ─────────────────────────────
+        self._terminal = TerminalWidget()
+        self._terminal.setMaximumHeight(160)
+        self._terminal.setVisible(False)
+        layout.addWidget(self._terminal)
+
+        # ── Model picker section (hidden by default) ──────────────────
+        self._model_section = QWidget()
+        model_layout = QVBoxLayout(self._model_section)
+        model_layout.setContentsMargins(0, 8, 0, 0)
+        model_layout.addWidget(QLabel("Pick a model to download:"))
+
+        self._model_combo = QComboBox()
+        for m in SUGGESTED_MODELS:
+            self._model_combo.addItem(m["desc"], m["name"])
+        model_layout.addWidget(self._model_combo)
+
+        self._btn_pull = QPushButton("Download selected model")
+        self._btn_pull.clicked.connect(self._on_pull_clicked)
+        model_layout.addWidget(self._btn_pull)
+
+        self._pull_status, self._pull_progress = QLabel(""), QProgressBar()
+        self._pull_progress.setRange(0, 100)
+        self._pull_progress.setVisible(False)
+        model_layout.addWidget(self._pull_status)
+        model_layout.addWidget(self._pull_progress)
+
+        self._model_section.setVisible(False)
+        layout.addWidget(self._model_section)
+
+        # ── Bottom buttons ────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        self._btn_recheck = QPushButton("Re-check")
+        self._btn_recheck.clicked.connect(self.run_checks)
+        self._btn_continue = QPushButton("Continue →")
+        self._btn_continue.setEnabled(False)
+        self._btn_continue.clicked.connect(self._on_continue)
+        btn_row.addWidget(self._btn_recheck)
+        btn_row.addStretch()
+        btn_row.addWidget(self._btn_continue)
+        layout.addLayout(btn_row)
+        layout.addStretch()
+
+    # ── Run checks ────────────────────────────────────────────────────
+
+    def run_checks(self) -> None:
+        """Start (or restart) the setup checks."""
+        # Reset UI.
+        self._lbl_installed.setText(f"{_CHECKING} Ollama installed — checking…")
+        self._lbl_server.setText(f"{_CHECKING} Ollama server — waiting…")
+        self._lbl_models.setText(f"{_CHECKING} Models available — waiting…")
+        self._install_section.setVisible(False)
+        self._model_section.setVisible(False)
+        self._btn_continue.setEnabled(False)
+
+        # Stop any running worker.
+        if self._setup_worker and self._setup_worker.isRunning():
+            self._setup_worker.stop()
+            self._setup_worker.wait(2000)
+
+        self._setup_worker = SetupWorker(self._ollama_url, parent=self)
+        self._setup_worker.check_result.connect(self._on_check_result)
+        self._setup_worker.all_done.connect(self._on_all_done)
+        self._setup_worker.start()
+
+    # ── Slots: check results ──────────────────────────────────────────
+
+    @Slot(str, bool, str)
+    def _on_check_result(self, name: str, ok: bool, detail: str) -> None:
+        icon = _OK if ok else _FAIL
+        labels = {
+            "installed": self._lbl_installed,
+            "server": self._lbl_server,
+            "models": self._lbl_models,
+        }
+        lbl = labels.get(name)
+        if lbl:
+            lbl.setText(f"{icon} {name.replace('_', ' ').title()} — {detail}")
+
+    @Slot(bool, list, bool)
+    def _on_all_done(self, all_ok: bool, models: list[str], server_started: bool) -> None:
+        if server_started:
+            self._server_started_by_us = True
+        self._discovered_models = models
+
+        if all_ok:
+            self._btn_continue.setEnabled(True)
+            self._install_section.setVisible(False)
+            self._model_section.setVisible(False)
+        else:
+            # Figure out what failed and show the right action section.
+            if _FAIL in self._lbl_installed.text():
+                self._show_install_section()
+            elif _FAIL in self._lbl_models.text():
+                self._model_section.setVisible(True)
+
+    # ── Install flow ──────────────────────────────────────────────────
+
+    def _show_install_section(self) -> None:
+        plan = get_install_plan()
+        self._current_plan = plan
+
+        if plan.can_auto_install:
+            self._manual_steps.setPlainText(
+                f"Command to run:\n  {plan.display_command}\n\n"
+                f"If this fails, here are manual steps:\n{plan.manual_steps}"
+            )
+            self._btn_install.setVisible(True)
+            self._btn_install.setText(f'Run "{plan.display_command}"')
+        else:
+            self._manual_steps.setPlainText(plan.manual_steps)
+            self._btn_install.setVisible(False)
+
+        self._install_section.setVisible(True)
+
+    def _on_install_clicked(self) -> None:
+        """User clicked the install button — confirm first, then run."""
+        plan = self._current_plan
+        reply = QMessageBox.question(
+            self,
+            "Confirm install",
+            f"Ollambo will run this command:\n\n  {plan.display_command}\n\nProceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._terminal.clear_output()
+        self._terminal.setVisible(True)
+        self._btn_install.setEnabled(False)
+
+        self._install_worker = InstallWorker(plan, parent=self)
+        self._install_worker.output_line.connect(self._terminal.append_text)
+        self._install_worker.finished_install.connect(self._on_install_finished)
+        self._install_worker.start()
+
+    @Slot(bool, str)
+    def _on_install_finished(self, success: bool, message: str) -> None:
+        self._btn_install.setEnabled(True)
+        self._terminal.append_text(f"\n{message}\n")
+        if success:
+            # Re-run checks to verify install worked.
+            self.run_checks()
+
+    # ── Model pull flow ───────────────────────────────────────────────
+
+    def _on_pull_clicked(self) -> None:
+        model = self._model_combo.currentData()
+        if not model:
+            return
+
+        self._btn_pull.setEnabled(False)
+        self._pull_progress.setVisible(True)
+        self._pull_progress.setValue(0)
+        self._pull_status.setText(f"Downloading {model}…")
+
+        self._pull_worker = PullWorker(model, self._ollama_url, parent=self)
+        self._pull_worker.progress.connect(self._on_pull_progress)
+        self._pull_worker.finished_pull.connect(self._on_pull_finished)
+        self._pull_worker.start()
+
+    @Slot(str, int, int)
+    def _on_pull_progress(self, status: str, completed: int, total: int) -> None:
+        if total > 0:
+            pct = int(completed * 100 / total)
+            self._pull_progress.setValue(pct)
+        self._pull_status.setText(status)
+
+    @Slot(bool, str)
+    def _on_pull_finished(self, success: bool, message: str) -> None:
+        self._btn_pull.setEnabled(True)
+        self._pull_status.setText(message)
+        self._pull_progress.setVisible(False)
+        if success:
+            # Re-run checks — this time models should be found.
+            self.run_checks()
+
+    # ── Continue ──────────────────────────────────────────────────────
+
+    def _on_continue(self) -> None:
+        models = getattr(self, "_discovered_models", [])
+        self.setup_complete.emit(models, self._server_started_by_us)
+
+    # ── Cleanup ───────────────────────────────────────────────────────
+
+    def stop_workers(self) -> None:
+        """Stop all running workers (called on app exit)."""
+        for w in (self._setup_worker, self._install_worker, self._pull_worker):
+            if w and w.isRunning():
+                w.stop()
+                w.wait(2000)

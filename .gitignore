@@ -1,0 +1,48 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+*.whl
+
+# PyInstaller (keep tracked ollambo.spec)
+*.spec
+!ollambo.spec
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Qt / PySide6 cache
+*.qmlc
+*.jsc
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.lnk
+
+# Temporary files & logs
+*.log
+*.tmp
+*.zip
+
+# Test & coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
