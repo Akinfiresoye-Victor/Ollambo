@@ -32,6 +32,8 @@ When launched, `install.py` prompts for the desired target installation director
 ```bash
 python install.py                   # Interactive install (prompts for location & B to browse)
 python install.py --dir "C:\Apps"   # Install directly to a specific folder
+python install.py --update          # Automatically update existing installation if changes are found
+python install.py --override        # Override and reinstall even if existing version is up to date
 python install.py --onefile         # Package into a single standalone executable
 python install.py --dev             # Install in editable developer mode (pip install -e .)
 python install.py --no-shortcut     # Skip creating Desktop/Start Menu shortcuts
