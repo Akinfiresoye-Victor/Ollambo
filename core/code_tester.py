@@ -133,6 +133,36 @@ def run_automated_tests(
     return True, "All tests passed successfully."
 
 
+def extract_error_line_number(err_msg: str) -> int | None:
+    """Extract line number from error message (e.g. 'line 42', 'line: 42')."""
+    if not err_msg:
+        return None
+    m = re.search(r"\bline[:\s=]+(\d+)\b", err_msg, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def get_surrounding_code_snippet(code: str, line_no: int, window: int = 40) -> tuple[str, int, int]:
+    """Return ~40 lines centered around line_no (1-indexed).
+
+    Returns (snippet, start_line_idx, end_line_idx).
+    """
+    lines = code.splitlines()
+    if not lines:
+        return "", 0, 0
+    half = window // 2
+    idx = max(0, min(line_no - 1, len(lines) - 1))
+    start = max(0, idx - half)
+    end = min(len(lines), start + window)
+    start = max(0, end - window)
+    snippet = "\n".join(lines[start:end])
+    return snippet, start, end
+
+
 def test_and_repair(
     ollama_url: str,
     model: str,
@@ -141,70 +171,110 @@ def test_and_repair(
     step_desc: str,
     all_files: dict[str, str] | None = None,
     num_ctx: int = 8192,
-    max_retries: int = 2,
+    max_retries: int | None = None,
     stop_flag: Callable[[], bool] | None = None,
     on_repair_status: Callable[[str], None] | None = None,
+    client: OllamaClient | None = None,
+    low_power: bool = False,
 ) -> tuple[str, bool, str]:
     """
     Tests the code and automatically repairs any caught bugs using a self-healing LLM loop.
     Returns (final_code, tests_passed, status_summary).
     """
+    if max_retries is None:
+        max_retries = 1 if low_power else 2
+
     current_code = code
     passed, err = run_automated_tests(filename, current_code, all_files)
     if passed:
         return current_code, True, "Passed on initial test"
 
-    client = OllamaClient(ollama_url)
+    own_client = False
+    if client is None:
+        client = OllamaClient(ollama_url)
+        own_client = True
 
-    for attempt in range(1, max_retries + 1):
-        if stop_flag and stop_flag():
-            return current_code, False, "Cancelled by user"
+    try:
+        for attempt in range(1, max_retries + 1):
+            if stop_flag and stop_flag():
+                return current_code, False, "Cancelled by user"
 
-        if on_repair_status:
-            on_repair_status(f"🔧 Testing caught issue in `{filename}`: {err}. Auto-fixing (attempt {attempt}/{max_retries})…")
+            if on_repair_status:
+                on_repair_status(f"🔧 Testing caught issue in `{filename}`: {err}. Auto-fixing (attempt {attempt}/{max_retries})…")
 
-        prompt = CODE_FIXER_USER.format(
-            file=filename,
-            step_desc=step_desc,
-            code=current_code,
-            error=err,
-        )
+            lines = current_code.splitlines()
+            is_large = len(lines) > 50
+            err_line = extract_error_line_number(err)
+            start_idx = 0
+            end_idx = len(lines)
 
-        messages = [
-            {"role": "system", "content": CODE_TESTER_SYSTEM},
-            {"role": "user", "content": prompt},
-        ]
+            if is_large and err_line is not None:
+                snippet, start_idx, end_idx = get_surrounding_code_snippet(current_code, err_line, 40)
+                code_to_send = f"# ... [Lines 1-{start_idx} omitted] ...\n{snippet}\n# ... [Remaining lines omitted] ..."
+            else:
+                code_to_send = current_code
 
-        import os
-        optimal_threads = min(8, max(2, os.cpu_count() or 4))
-        chunks: list[str] = []
-        for chunk in client.chat_stream(
-            model=model,
-            messages=messages,
-            options={
+            prompt = CODE_FIXER_USER.format(
+                file=filename,
+                step_desc=step_desc,
+                code=code_to_send,
+                error=err,
+            )
+
+            messages = [
+                {"role": "system", "content": CODE_TESTER_SYSTEM},
+                {"role": "user", "content": prompt},
+            ]
+
+            from core.storage import get_configured_threads
+            repair_opts: dict[str, Any] = {
                 "num_ctx": num_ctx,
                 "temperature": 0.2,
                 "top_p": 0.9,
-                "num_thread": optimal_threads,
-            },
-            stop_flag=stop_flag,
-        ):
-            if stop_flag and stop_flag():
-                return current_code, False, "Cancelled by user"
-            content = chunk.get("message", {}).get("content", "")
-            if content:
-                chunks.append(content)
-            if chunk.get("done", False):
-                break
+            }
+            threads = get_configured_threads()
+            if threads is not None:
+                repair_opts["num_thread"] = threads
 
-        repaired = clean_code_fence("".join(chunks))
-        if repaired and repaired.strip():
-            current_code = repaired
+            chunks: list[str] = []
+            for chunk in client.chat_stream(
+                model=model,
+                messages=messages,
+                options=repair_opts,
+                stop_flag=stop_flag,
+            ):
+                if stop_flag and stop_flag():
+                    return current_code, False, "Cancelled by user"
+                content = chunk.get("message", {}).get("content", "")
+                if content:
+                    chunks.append(content)
+                if chunk.get("done", False):
+                    break
 
-        passed, err = run_automated_tests(filename, current_code, all_files)
-        if passed:
-            if on_repair_status:
-                on_repair_status(f"✅ Tester Agent successfully fixed `{filename}` on attempt {attempt}!")
-            return current_code, True, f"Repaired on attempt {attempt}"
+            repaired = clean_code_fence("".join(chunks))
+            if repaired and repaired.strip():
+                if is_large and err_line is not None:
+                    repaired_lines = repaired.splitlines()
+                    if len(repaired_lines) < len(lines) - 15:
+                        spliced = "\n".join(lines[:start_idx]) + ("\n" if start_idx > 0 else "") + repaired + ("\n" if end_idx < len(lines) else "") + "\n".join(lines[end_idx:])
+                        p_splice, _ = run_automated_tests(filename, spliced, all_files)
+                        p_full, _ = run_automated_tests(filename, repaired, all_files)
+                        if p_splice or not p_full:
+                            current_code = spliced
+                        else:
+                            current_code = repaired
+                    else:
+                        current_code = repaired
+                else:
+                    current_code = repaired
 
-    return current_code, False, f"Remaining issue after {max_retries} attempts: {err}"
+            passed, err = run_automated_tests(filename, current_code, all_files)
+            if passed:
+                if on_repair_status:
+                    on_repair_status(f"✅ Tester Agent successfully fixed `{filename}` on attempt {attempt}!")
+                return current_code, True, f"Repaired on attempt {attempt}"
+
+        return current_code, False, f"Remaining issue after {max_retries} attempts: {err}"
+    finally:
+        if own_client:
+            client.close()

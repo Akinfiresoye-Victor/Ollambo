@@ -120,75 +120,85 @@ def generate_plan(
     user_request: str,
     num_ctx: int = 8192,
     stop_flag: Callable[[], bool] | None = None,
+    client: OllamaClient | None = None,
 ) -> CodingPlan:
     """Call Ollama to generate a structured coding plan with fallback retries."""
-    client = OllamaClient(ollama_url)
+    own_client = False
+    if client is None:
+        client = OllamaClient(ollama_url)
+        own_client = True
 
     messages = [
         {"role": "system", "content": PLANNER_SYSTEM},
         {"role": "user", "content": user_request},
     ]
 
-    optimal_threads = min(8, max(2, os.cpu_count() or 4))
-    gen_opts = {
+    from core.storage import get_configured_threads
+    gen_opts: dict[str, Any] = {
         "num_ctx": num_ctx,
         "temperature": 0.2,
         "top_p": 0.9,
-        "num_thread": optimal_threads,
     }
+    threads = get_configured_threads()
+    if threads is not None:
+        gen_opts["num_thread"] = threads
 
-    # Attempt 1: Using JSON format schema
-    response_chunks: list[str] = []
-    for chunk in client.chat_stream(
-        model=model,
-        messages=messages,
-        options=gen_opts,
-        format_schema=PLAN_JSON_SCHEMA,
-        stop_flag=stop_flag,
-    ):
-        if stop_flag and stop_flag():
-            return CodingPlan(goal="Cancelled", raw_text="Cancelled by user")
-        content = chunk.get("message", {}).get("content", "")
-        if content:
-            response_chunks.append(content)
-        if chunk.get("done", False):
-            break
+    try:
+        # Attempt 1: Using JSON format schema
+        response_chunks: list[str] = []
+        for chunk in client.chat_stream(
+            model=model,
+            messages=messages,
+            options=gen_opts,
+            format_schema=PLAN_JSON_SCHEMA,
+            stop_flag=stop_flag,
+        ):
+            if stop_flag and stop_flag():
+                return CodingPlan(goal="Cancelled", raw_text="Cancelled by user")
+            content = chunk.get("message", {}).get("content", "")
+            if content:
+                response_chunks.append(content)
+            if chunk.get("done", False):
+                break
 
-    full_output = "".join(response_chunks).strip()
-    plan = parse_plan_json(full_output)
-    if plan and plan.steps:
-        return plan
+        full_output = "".join(response_chunks).strip()
+        plan = parse_plan_json(full_output)
+        if plan and plan.steps:
+            return plan
 
-    # Attempt 2: Fallback retry if parsing failed
-    messages.append({"role": "assistant", "content": full_output})
-    messages.append({"role": "user", "content": PLANNER_JSON_RETRY})
+        # Attempt 2: Fallback retry if parsing failed
+        messages.append({"role": "assistant", "content": full_output})
+        messages.append({"role": "user", "content": PLANNER_JSON_RETRY})
 
-    retry_chunks: list[str] = []
-    for chunk in client.chat_stream(
-        model=model,
-        messages=messages,
-        options=gen_opts,
-        format_schema="json",
-        stop_flag=stop_flag,
-    ):
-        if stop_flag and stop_flag():
-            return CodingPlan(goal="Cancelled", raw_text="Cancelled by user")
-        content = chunk.get("message", {}).get("content", "")
-        if content:
-            retry_chunks.append(content)
-        if chunk.get("done", False):
-            break
+        retry_chunks: list[str] = []
+        for chunk in client.chat_stream(
+            model=model,
+            messages=messages,
+            options=gen_opts,
+            format_schema="json",
+            stop_flag=stop_flag,
+        ):
+            if stop_flag and stop_flag():
+                return CodingPlan(goal="Cancelled", raw_text="Cancelled by user")
+            content = chunk.get("message", {}).get("content", "")
+            if content:
+                retry_chunks.append(content)
+            if chunk.get("done", False):
+                break
 
-    retry_output = "".join(retry_chunks).strip()
-    plan = parse_plan_json(retry_output)
-    if plan and plan.steps:
-        return plan
+        retry_output = "".join(retry_chunks).strip()
+        plan = parse_plan_json(retry_output)
+        if plan and plan.steps:
+            return plan
 
-    # Final Fallback: Return raw text plan rather than crashing
-    return CodingPlan(
-        goal=user_request[:60] + "…",
-        assumptions=["Parsed from raw output fallback"],
-        files=[],
-        steps=[PlanStep(step=1, description="Execute task according to plan", file="output.txt")],
-        raw_text=retry_output or full_output,
-    )
+        # Final Fallback: Return raw text plan rather than crashing
+        return CodingPlan(
+            goal=user_request[:60] + "…",
+            assumptions=["Parsed from raw output fallback"],
+            files=[],
+            steps=[PlanStep(step=1, description="Execute task according to plan", file="output.txt")],
+            raw_text=retry_output or full_output,
+        )
+    finally:
+        if own_client:
+            client.close()

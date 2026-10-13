@@ -123,9 +123,13 @@ def generate_single_file(
     max_continuations: int = 8,
     on_progress: Callable[[int, int], None] | None = None,
     stop_flag: Callable[[], bool] | None = None,
+    client: OllamaClient | None = None,
 ) -> str:
     """Generate source code for a file, continuing automatically if output is cut off."""
-    client = OllamaClient(ollama_url)
+    own_client = False
+    if client is None:
+        client = OllamaClient(ollama_url)
+        own_client = True
 
     plan_desc = f"Goal: {plan.goal}\nSteps:\n" + "\n".join(
         f"{s.step}. {s.description} -> {s.file}" for s in plan.steps
@@ -139,59 +143,25 @@ def generate_single_file(
         file=step.file,
     )
 
-    messages = [
-        {"role": "system", "content": CODE_WRITER_SYSTEM},
-        {"role": "user", "content": prompt},
-    ]
+    system_msg = {"role": "system", "content": CODE_WRITER_SYSTEM}
+    original_task_msg = {"role": "user", "content": prompt}
+    messages = [system_msg, original_task_msg]
 
     # ── Initial Generation (Part 1) ───────────────────────────────────
     chunks: list[str] = []
     done_reason = "stop"
 
-    optimal_threads = min(8, max(2, os.cpu_count() or 4))
-    gen_options = {
+    from core.storage import get_configured_threads
+    gen_options: dict[str, Any] = {
         "num_ctx": num_ctx,
         "temperature": 0.2,
         "top_p": 0.9,
-        "num_thread": optimal_threads,
     }
+    threads = get_configured_threads()
+    if threads is not None:
+        gen_options["num_thread"] = threads
 
-    for chunk in client.chat_stream(
-        model=model,
-        messages=messages,
-        options=gen_options,
-        stop_flag=stop_flag,
-    ):
-        if stop_flag and stop_flag():
-            return ""
-        content = chunk.get("message", {}).get("content", "")
-        if content:
-            chunks.append(content)
-        if chunk.get("done", False):
-            done_reason = chunk.get("done_reason", "stop")
-            break
-
-    accumulated = clean_code_fence("".join(chunks))
-    part = 1
-
-    # ── Automatic Continuation Loop ───────────────────────────────────
-    while done_reason == "length" and part < max_continuations:
-        if stop_flag and stop_flag():
-            break
-
-        part += 1
-        if on_progress:
-            on_progress(part, max_continuations)
-
-        last_lines = get_last_n_lines(accumulated, 30)
-        cont_prompt = CONTINUATION_PROMPT.format(file=step.file, last_lines=last_lines)
-
-        messages.append({"role": "assistant", "content": "".join(chunks)})
-        messages.append({"role": "user", "content": cont_prompt})
-
-        chunks = []
-        done_reason = "stop"
-
+    try:
         for chunk in client.chat_stream(
             model=model,
             messages=messages,
@@ -199,7 +169,7 @@ def generate_single_file(
             stop_flag=stop_flag,
         ):
             if stop_flag and stop_flag():
-                return accumulated
+                return ""
             content = chunk.get("message", {}).get("content", "")
             if content:
                 chunks.append(content)
@@ -207,6 +177,49 @@ def generate_single_file(
                 done_reason = chunk.get("done_reason", "stop")
                 break
 
-        accumulated = stitch_continuation(accumulated, "".join(chunks))
+        accumulated = clean_code_fence("".join(chunks))
+        part = 1
 
-    return accumulated
+        # ── Automatic Continuation Loop ───────────────────────────────────
+        while done_reason == "length" and part < max_continuations:
+            if stop_flag and stop_flag():
+                break
+
+            part += 1
+            if on_progress:
+                on_progress(part, max_continuations)
+
+            last_lines = get_last_n_lines(accumulated, 30)
+            cont_prompt = CONTINUATION_PROMPT.format(file=step.file, last_lines=last_lines)
+
+            # Keep only the system prompt, original task, and last continuation prompt
+            messages = [
+                system_msg,
+                original_task_msg,
+                {"role": "user", "content": cont_prompt},
+            ]
+
+            chunks = []
+            done_reason = "stop"
+
+            for chunk in client.chat_stream(
+                model=model,
+                messages=messages,
+                options=gen_options,
+                stop_flag=stop_flag,
+            ):
+                if stop_flag and stop_flag():
+                    return accumulated
+                content = chunk.get("message", {}).get("content", "")
+                if content:
+                    chunks.append(content)
+                if chunk.get("done", False):
+                    done_reason = chunk.get("done_reason", "stop")
+                    break
+
+            accumulated = stitch_continuation(accumulated, "".join(chunks))
+
+        return accumulated
+    finally:
+        if own_client:
+            client.close()

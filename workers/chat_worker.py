@@ -66,59 +66,72 @@ class ChatWorker(QThread):
         self._stop = True
 
     def run(self) -> None:
-        num_ctx = int(self._options.get("num_ctx", 8192))
-        est_tokens = estimate_messages_tokens(self._messages)
+        client = OllamaClient(self._url)
+        try:
+            num_ctx = int(self._options.get("num_ctx", 8192))
+            est_tokens = estimate_messages_tokens(self._messages)
 
-        # ── 1. Pre-chat Compaction Check ──────────────────────────────
-        payload_messages = self._messages
-        threshold_limit = int(num_ctx * 0.75)
-        if is_compaction_needed(est_tokens, num_ctx, threshold_ratio=0.75):
-            self.compaction_started.emit(est_tokens, threshold_limit)
-            sys_msgs, to_summarize, recent_msgs = split_for_compaction(self._messages, keep_recent=4)
-            if to_summarize:
-                try:
-                    summary = generate_summary(
-                        ollama_url=self._url,
-                        model=self._summarizer_model,
-                        messages_to_summarize=to_summarize,
-                        stop_flag=lambda: self._stop,
-                    )
-                    if summary and not self._stop:
-                        payload_messages = build_compacted_messages(sys_msgs, summary, recent_msgs)
+            # ── 1. Pre-chat Compaction Check ──────────────────────────────
+            payload_messages = self._messages
+            threshold_limit = int(num_ctx * 0.75)
+            if is_compaction_needed(est_tokens, num_ctx, threshold_ratio=0.75):
+                self.compaction_started.emit(est_tokens, threshold_limit)
+                sys_msgs, to_summarize, recent_msgs = split_for_compaction(self._messages, keep_recent=4)
+                if to_summarize:
+                    # Default: instant extractive summary (zero LLM calls). Model summary is opt-in.
+                    use_model = bool(self._options.get("use_model_summaries", False)) and not bool(self._options.get("low_power_mode", False))
+                    if use_model:
+                        try:
+                            summary = generate_summary(
+                                ollama_url=self._url,
+                                model=self._summarizer_model,
+                                messages_to_summarize=to_summarize,
+                                stop_flag=lambda: self._stop,
+                                num_ctx=num_ctx,
+                                client=client,
+                            )
+                            if not summary or self._stop:
+                                summary = build_extractive_summary(to_summarize)
+                        except Exception:
+                            summary = build_extractive_summary(to_summarize)
                     else:
                         summary = build_extractive_summary(to_summarize)
-                        payload_messages = build_compacted_messages(sys_msgs, summary, recent_msgs)
-                except Exception:
-                    summary = build_extractive_summary(to_summarize)
+
                     payload_messages = build_compacted_messages(sys_msgs, summary, recent_msgs)
+                    new_tokens = estimate_messages_tokens(payload_messages)
+                    self.compaction_performed.emit(payload_messages, est_tokens, new_tokens)
 
-                new_tokens = estimate_messages_tokens(payload_messages)
-                self.compaction_performed.emit(payload_messages, est_tokens, new_tokens)
+            if self._stop:
+                return
 
-        if self._stop:
-            return
+            # ── 2. Stream Chat Response ───────────────────────────────────
+            full_text: list[str] = []
+            final_meta: dict[str, Any] = {}
 
-        # ── 2. Stream Chat Response ───────────────────────────────────
-        client = OllamaClient(self._url)
-        full_text: list[str] = []
-        final_meta: dict[str, Any] = {}
+            from core.storage import get_configured_threads, get_effective_keep_alive
+            chat_opts = dict(self._options)
+            chat_opts.pop("low_power_mode", None)
+            chat_opts.pop("use_model_summaries", None)
 
-        import os
-        optimal_threads = min(8, max(2, os.cpu_count() or 4))
-        chat_opts = dict(self._options)
-        if "num_thread" not in chat_opts:
-            chat_opts["num_thread"] = optimal_threads
-        if "temperature" not in chat_opts:
-            chat_opts["temperature"] = 0.2
-        if "top_p" not in chat_opts:
-            chat_opts["top_p"] = 0.9
+            threads = chat_opts.get("num_thread") if "num_thread" in chat_opts else get_configured_threads(self._options)
+            if threads is not None:
+                chat_opts["num_thread"] = threads
+            elif "num_thread" in chat_opts:
+                chat_opts.pop("num_thread", None)
 
-        try:
+            if "temperature" not in chat_opts:
+                chat_opts["temperature"] = 0.2
+            if "top_p" not in chat_opts:
+                chat_opts["top_p"] = 0.9
+
+            keep_alive = get_effective_keep_alive(self._options)
+
             stream = client.chat_stream(
                 model=self._model,
                 messages=payload_messages,
                 options=chat_opts,
                 stop_flag=lambda: self._stop,
+                keep_alive=keep_alive,
             )
 
             for chunk in stream:

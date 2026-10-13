@@ -128,12 +128,22 @@ def classify_heuristic(prompt: str) -> TaskType | None:
     return "chat"
 
 
-def classify_with_llm(ollama_url: str, model: str, prompt: str) -> TaskType:
+def classify_with_llm(
+    ollama_url: str,
+    model: str,
+    prompt: str,
+    num_ctx: int = 8192,
+    client: OllamaClient | None = None,
+) -> TaskType:
     """
     Fast LLM-based fallback classification when heuristic is ambiguous.
     """
-    import os
-    client = OllamaClient(ollama_url)
+    from core.storage import get_configured_threads
+    own_client = False
+    if client is None:
+        client = OllamaClient(ollama_url)
+        own_client = True
+
     system_prompt = (
         "You are an intent classifier. Categorize the user's request as one of:\n"
         "- 'code': The user wants a script, app, project, or code built or fixed.\n"
@@ -144,11 +154,15 @@ def classify_with_llm(ollama_url: str, model: str, prompt: str) -> TaskType:
 
     try:
         chunks = []
-        opts = {
+        opts: dict[str, Any] = {
             "num_predict": 4,
             "temperature": 0.0,
-            "num_thread": min(8, max(2, os.cpu_count() or 4)),
+            "num_ctx": num_ctx,
         }
+        threads = get_configured_threads()
+        if threads is not None:
+            opts["num_thread"] = threads
+
         for chunk in client.chat_stream(
             model=model,
             messages=[
@@ -171,11 +185,20 @@ def classify_with_llm(ollama_url: str, model: str, prompt: str) -> TaskType:
             return "chat"
     except Exception:
         pass
+    finally:
+        if own_client:
+            client.close()
 
     return "chat"
 
 
-def classify_task(prompt: str, ollama_url: str = "", model: str = "") -> TaskType:
+def classify_task(
+    prompt: str,
+    ollama_url: str = "",
+    model: str = "",
+    num_ctx: int = 8192,
+    client: OllamaClient | None = None,
+) -> TaskType:
     """
     Autonomously decide whether the task is 'chat', 'code', or 'both'.
     Uses fast heuristics first, falling back to LLM for ambiguous prompts.
@@ -185,6 +208,6 @@ def classify_task(prompt: str, ollama_url: str = "", model: str = "") -> TaskTyp
         return verdict
 
     if ollama_url and model:
-        return classify_with_llm(ollama_url, model, prompt)
+        return classify_with_llm(ollama_url, model, prompt, num_ctx=num_ctx, client=client)
 
     return "chat"

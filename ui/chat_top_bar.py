@@ -70,9 +70,37 @@ class ChatTopBar(QWidget):
         self.mode_combo.addItem("🤖 Auto Detect", "auto")
         self.mode_combo.addItem("💻 Code Mode", "code")
         self.mode_combo.addItem("💬 Chat Only", "chat")
+        self.mode_combo.addItem("🔎 Research", "research")
         self.mode_combo.setToolTip("Mode: Auto lets Ollambo autonomously detect coding vs chat tasks")
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         ctrl_row.addWidget(self.mode_combo)
+
+        # Research depth selector (visible when Research mode is active)
+        self.depth_combo = QComboBox()
+        self.depth_combo.addItem("⚡ Quick", "quick")
+        self.depth_combo.addItem("🔍 Standard", "standard")
+        self.depth_combo.addItem("🔬 Thorough", "thorough")
+        self.depth_combo.setCurrentIndex(1)  # Default Standard
+        self.depth_combo.setToolTip("Research Depth: Quick (3 SQs), Standard (5 SQs + 1 follow-up), Thorough (7 SQs + 2 follow-ups)")
+        self.depth_combo.setVisible(False)
+        ctrl_row.addWidget(self.depth_combo)
+
+        # Legacy Deep research checkbox (for backwards compatibility)
+        self.chk_deep = QCheckBox("Deep")
+        self.chk_deep.setVisible(False)
+
+        # 🌐 Web badge — shown when internet access is enabled
+        self.lbl_web_badge = QLabel("🌐 Web")
+        self.lbl_web_badge.setToolTip(
+            "Internet access is enabled. Web Research mode is available.\n"
+            "Disable in Settings > Internet Access to go fully offline."
+        )
+        self.lbl_web_badge.setStyleSheet(
+            "color: #56b6c2; font-size: 11px; font-weight: bold; padding: 2px 8px; "
+            "border: 1px solid #56b6c2; border-radius: 4px; background-color: #1a2830;"
+        )
+        self.lbl_web_badge.setVisible(False)
+        ctrl_row.addWidget(self.lbl_web_badge)
 
         # ── Keep-Alive Connection Badge ────────────────────────────────
         self.lbl_connection = QLabel("⚪ Standby (loads on prompt)")
@@ -121,10 +149,15 @@ class ChatTopBar(QWidget):
         self.status_container.setVisible(False)
         main_layout.addWidget(self.status_container)
 
-        # 1-second countdown timer for 5-minute inactivity window
+        # 1-second countdown timer for inactivity window (default 3m = 180s, configurable)
+        self._keep_alive_seconds = 180
         self._keep_alive_timer = QTimer(self)
         self._keep_alive_timer.setInterval(1000)
         self._keep_alive_timer.timeout.connect(self._on_timer_tick)
+
+    def set_keep_alive_seconds(self, seconds: int) -> None:
+        """Set idle keep_alive countdown duration in seconds."""
+        self._keep_alive_seconds = max(10, int(seconds))
 
     def _on_model_text_changed(self, model: str) -> None:
         self.model_changed.emit(model)
@@ -144,19 +177,19 @@ class ChatTopBar(QWidget):
         self._is_connected = True
         self._is_working = True
         self._keep_alive_timer.stop()
-        self._seconds_remaining = 180  # 3 minutes
+        self._seconds_remaining = self._keep_alive_seconds
         self.lbl_connection.setText("🟢 Active (working…)")
-        self.lbl_connection.setToolTip("Model is actively executing a task. The 3-minute idle countdown is paused.")
+        self.lbl_connection.setToolTip("Model is actively executing a task. The idle countdown is paused.")
         self.lbl_connection.setStyleSheet(
             "color: #98c379; font-size: 11px; font-weight: bold; padding: 2px 8px; "
             "border: 1px solid #98c379; border-radius: 4px; background-color: #1e2820;"
         )
 
     def set_idle(self) -> None:
-        """Called when a task finishes. Starts 3-minute idle countdown."""
+        """Called when a task finishes. Starts idle countdown."""
         self._is_connected = True
         self._is_working = False
-        self._seconds_remaining = 180  # 3 minutes
+        self._seconds_remaining = self._keep_alive_seconds
         self._update_connection_badge()
         if not self._keep_alive_timer.isActive():
             self._keep_alive_timer.start()
@@ -238,17 +271,60 @@ class ChatTopBar(QWidget):
 
     def _on_mode_changed(self) -> None:
         m = self.current_mode()
+        # Show Depth selector only in Research mode
+        self.depth_combo.setVisible(m == "research")
+        self.chk_deep.setVisible(False)
         self.mode_changed.emit(m)
-        self.coding_mode_toggled.emit(m != "chat")
+        self.coding_mode_toggled.emit(m not in ("chat", "research"))
 
     def current_mode(self) -> str:
         return self.mode_combo.currentData() or "auto"
+
+    def research_depth(self) -> str:
+        """Return selected depth: quick, standard, or thorough."""
+        return self.depth_combo.currentData() or "standard"
+
+    def is_deep_research(self) -> bool:
+        """Return True if depth is not quick (for backward compatibility)."""
+        return self.research_depth() != "quick"
+
+    def set_low_power_mode(self, enabled: bool) -> None:
+        """Force Quick depth when low power mode is active."""
+        if enabled:
+            idx = self.depth_combo.findData("quick")
+            if idx >= 0:
+                self.depth_combo.setCurrentIndex(idx)
+            self.depth_combo.setEnabled(False)
+            self.depth_combo.setToolTip("Quick depth is enforced because Low-Power Mode is active.")
+        else:
+            self.depth_combo.setEnabled(True)
+            self.depth_combo.setToolTip("Research Depth: Quick (3 SQs), Standard (5 SQs + 1 follow-up), Thorough (7 SQs + 2 follow-ups)")
+
+    def set_internet_access(self, allowed: bool) -> None:
+        """Show/hide web badge and enable/disable Research mode option."""
+        self.lbl_web_badge.setVisible(allowed)
+        idx = self.mode_combo.findData("research")
+        if idx >= 0:
+            # QComboBox has no built-in item disable; use flags via model
+            from PySide6.QtCore import Qt  # local import to avoid top-level cycle
+            model = self.mode_combo.model()
+            item = model.item(idx)
+            if item:
+                if allowed:
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEnabled)
+                else:
+                    item.setFlags(
+                        item.flags() & ~Qt.ItemFlag.ItemIsEnabled
+                    )
+                    # If currently in research mode and access was revoked, switch to auto
+                    if self.current_mode() == "research":
+                        self.set_mode("auto")
 
     def set_mode(self, mode: str | bool) -> None:
         if isinstance(mode, bool):
             val = "code" if mode else "auto"
         else:
-            val = mode if mode in ("auto", "code", "chat") else "auto"
+            val = mode if mode in ("auto", "code", "chat", "research") else "auto"
         idx = self.mode_combo.findData(val)
         if idx >= 0:
             self.mode_combo.setCurrentIndex(idx)

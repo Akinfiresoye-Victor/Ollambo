@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QThread, Signal
 
+from core.ollama_client import OllamaClient
 from core.planner import CodingPlan, generate_plan
 
 
@@ -41,6 +42,7 @@ class PlanWorker(QThread):
         self._stop = True
 
     def run(self) -> None:
+        client = OllamaClient(self._url)
         try:
             plan = generate_plan(
                 ollama_url=self._url,
@@ -48,6 +50,7 @@ class PlanWorker(QThread):
                 user_request=self._request,
                 num_ctx=self._num_ctx,
                 stop_flag=lambda: self._stop,
+                client=client,
             )
             if self._stop:
                 self.plan_error.emit("Planning cancelled by user.")
@@ -55,3 +58,5 @@ class PlanWorker(QThread):
                 self.plan_ready.emit(plan)
         except Exception as e:
             self.plan_error.emit(f"Failed to generate plan: {e}")
+        finally:
+            client.close()

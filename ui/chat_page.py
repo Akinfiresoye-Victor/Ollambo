@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
@@ -27,7 +28,14 @@ from core.build_session import complete_session, get_resume_step, load_session, 
 from core.context_manager import estimate_messages_tokens, is_compaction_needed
 from core.ollama_client import OllamaClient
 from core.planner import CodingPlan
-from core.storage import list_active_sessions, load_chat, save_chat
+from core.storage import (
+    get_effective_keep_alive,
+    get_effective_keep_alive_seconds,
+    list_active_sessions,
+    load_chat,
+    resolve_num_ctx,
+    save_chat,
+)
 from core.task_classifier import classify_task, classify_heuristic
 from core.walkthrough import generate_project_walkthrough
 from ui.artifacts_panel import ArtifactsPanel
@@ -35,11 +43,14 @@ from ui.chat_sidebar import ChatSidebar
 from ui.chat_top_bar import ChatTopBar
 from ui.message_widget import ChatMessageWidget
 from ui.plan_panel import PlanPanel
+from ui.research_panel import ResearchPanel
+from ui.research_plan_panel import ResearchPlanPanel
 from ui.settings_dialog import SettingsDialog
 from workers.chat_worker import ChatWorker
 from workers.code_worker import CodeWorker
 from workers.models_worker import ModelsWorker
 from workers.plan_worker import PlanWorker
+from workers.research_worker import ResearchWorker
 
 
 class ContextLengthWorker(QThread):
@@ -64,15 +75,20 @@ class ClassifyWorker(QThread):
 
     result_ready = Signal(str)  # Emits 'chat', 'code', or 'both'
 
-    def __init__(self, ollama_url: str, model: str, prompt: str, parent=None) -> None:
+    def __init__(self, ollama_url: str, model: str, prompt: str, num_ctx: int = 8192, parent=None) -> None:
         super().__init__(parent)
         self._url = ollama_url
         self._model = model
         self._prompt = prompt
+        self._num_ctx = num_ctx
 
     def run(self) -> None:
-        result = classify_task(self._prompt, self._url, self._model)
-        self.result_ready.emit(result)
+        client = OllamaClient(self._url)
+        try:
+            result = classify_task(self._prompt, self._url, self._model, num_ctx=self._num_ctx, client=client)
+            self.result_ready.emit(result)
+        finally:
+            client.close()
 
 
 class PreloadWorker(QThread):
@@ -80,14 +96,15 @@ class PreloadWorker(QThread):
 
     finished_preload = Signal(str, bool)
 
-    def __init__(self, ollama_url: str, model: str, parent=None) -> None:
+    def __init__(self, ollama_url: str, model: str, keep_alive: str = "3m", parent=None) -> None:
         super().__init__(parent)
         self._url = ollama_url
         self._model = model
+        self._keep_alive = keep_alive
 
     def run(self) -> None:
         client = OllamaClient(self._url)
-        ok = client.preload_model(self._model, keep_alive="5m")
+        ok = client.preload_model(self._model, keep_alive=self._keep_alive)
         client.close()
         self.finished_preload.emit(self._model, ok)
 
@@ -120,6 +137,7 @@ class ChatPage(QWidget):
         self._active_chat_worker: ChatWorker | None = None
         self._active_plan_worker: PlanWorker | None = None
         self._active_code_worker: CodeWorker | None = None
+        self._active_research_worker: ResearchWorker | None = None
         self._preload_worker: PreloadWorker | None = None
         self._classify_worker: ClassifyWorker | None = None
 
@@ -141,9 +159,9 @@ class ChatPage(QWidget):
 
         self._is_hybrid_mode = False
 
-        # Smooth ~40fps streaming UI flush timer to prevent event loop bottlenecks
+        # Smooth ~100ms streaming UI flush timer to minimize CPU/VRAM load
         self._stream_flush_timer = QTimer(self)
-        self._stream_flush_timer.setInterval(25)
+        self._stream_flush_timer.setInterval(100)
         self._stream_flush_timer.timeout.connect(self._flush_stream_ui)
         self._pending_stream_dirty = False
 
@@ -189,6 +207,8 @@ class ChatPage(QWidget):
         self.top_bar.keep_warm_requested.connect(self._on_keep_warm_requested)
         self.top_bar.connection_expired.connect(self._on_connection_expired)
         self.top_bar.set_mode(self._settings.get("coding_mode", "auto"))
+        self.top_bar.set_keep_alive_seconds(get_effective_keep_alive_seconds(self._settings))
+        self.top_bar.set_internet_access(bool(self._settings.get("internet_access", False)))
         right_layout.addWidget(self.top_bar)
 
         # Center Tabs
@@ -208,11 +228,23 @@ class ChatPage(QWidget):
         self.plan_panel.plan_approved.connect(self._on_plan_approved)
         self.plan_panel.plan_rejected.connect(lambda: self.tabs.setCurrentIndex(0))
 
+        self.research_plan_panel = ResearchPlanPanel()
+        self.research_plan_panel.plan_approved.connect(self._on_research_plan_approved)
+        self.research_plan_panel.plan_cancelled.connect(lambda: self.tabs.setCurrentIndex(0))
+
+        self.plan_stack = QStackedWidget()
+        self.plan_stack.addWidget(self.plan_panel)
+        self.plan_stack.addWidget(self.research_plan_panel)
+
         self.artifacts_panel = ArtifactsPanel()
 
+        self.research_panel = ResearchPanel()
+        self.research_panel.resume_requested.connect(self._resume_research)
+
         self.tabs.addTab(self.scroll_area, "💬 Chat")
-        self.tabs.addTab(self.plan_panel, "📋 Plan")
+        self.tabs.addTab(self.plan_stack, "📋 Plan")
         self.tabs.addTab(self.artifacts_panel, "📦 Artifacts")
+        self.tabs.addTab(self.research_panel, "📚 Research")
         right_layout.addWidget(self.tabs)
 
         # Bottom Input Area
@@ -251,7 +283,7 @@ class ChatPage(QWidget):
         w.start()
 
     def _apply_context_length(self, ctx: int) -> None:
-        self._active_num_ctx = min(int(self._settings.get("num_ctx", 8192)), ctx)
+        self._active_num_ctx = resolve_num_ctx(self._settings, model_max_ctx=ctx)
         self._update_token_meter()
 
     def _update_token_meter(self) -> None:
@@ -270,7 +302,9 @@ class ChatPage(QWidget):
 
     def _on_keep_warm_requested(self, model: str) -> None:
         url = self._settings.get("ollama_url", "http://localhost:11434")
-        pw = self._preload_worker = PreloadWorker(url, model, parent=self)
+        pw = self._preload_worker = PreloadWorker(
+            url, model, keep_alive=get_effective_keep_alive(self._settings), parent=self
+        )
         pw.finished_preload.connect(self._on_preload_finished)
         pw.start()
 
@@ -568,6 +602,11 @@ class ChatPage(QWidget):
             self._dispatch_task("code", text, url, model, num_ctx)
         elif mode == "chat":
             self._dispatch_task("chat", text, url, model, num_ctx)
+        elif mode == "research":
+            if not self._settings.get("internet_access", False):
+                self._show_internet_blocked_error()
+                return
+            self._dispatch_research(text, url, model, num_ctx)
         else:
             # Auto mode: try fast heuristic first, only use LLM off-thread if ambiguous
             heuristic_result = classify_heuristic(text)
@@ -579,10 +618,322 @@ class ChatPage(QWidget):
                 self.top_bar.show_status("🤔 Analyzing task type…")
                 self._current_assistant_widget = ChatMessageWidget("assistant", "")
                 self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
-                cw = self._classify_worker = ClassifyWorker(url, model, text, parent=self)
+                cw = self._classify_worker = ClassifyWorker(url, model, text, num_ctx, parent=self)
                 cw.result_ready.connect(lambda task_type: self._on_classify_done(task_type, text, url, model, num_ctx))
                 cw.start()
 
+        self._scroll_to_bottom(force=True)
+
+    def _show_internet_blocked_error(self) -> None:
+        """Show an inline error when Research is selected but internet is disabled."""
+        err = (
+            "🌐 **Web Research is disabled.**\n\n"
+            "Enable it in **Settings > Internet Access** to use Research mode.\n\n"
+            "Ollambo is offline by default for privacy — web access is opt-in."
+        )
+        if not self._current_assistant_widget:
+            self._current_assistant_widget = ChatMessageWidget("assistant", err)
+            self.history_layout.insertWidget(
+                self.history_layout.count() - 1, self._current_assistant_widget
+            )
+        else:
+            self._current_assistant_widget.set_content(err, is_final=True)
+        self._cleanup_workers_state()
+
+    def _dispatch_research(self, question: str, url: str, model: str, num_ctx: int) -> None:
+        """Launch ResearchWorker to draft research plan or run deep research."""
+        depth = self.top_bar.research_depth()
+        auto_approve = bool(self._settings.get("auto_approve_research_plans", False))
+        self.top_bar.show_status(f"🔬 Deep Research ({depth.capitalize()}): drafting research plan…")
+
+        self._research_activity_log = [
+            "🌐 Web Access: ACTIVE (DuckDuckGo Live Search & Content Extraction)",
+            f"⚡ Preset: {depth.capitalize()} Depth",
+            "🧠 Drafting research plan and skeptic checklist with local LLM…",
+        ]
+
+        init_md = (
+            f"### 🔬 Deep Research: Initializing\n\n"
+            f"- **🌐 Web Access:** `ACTIVE` (DuckDuckGo Live Search & Content Extraction)\n"
+            f"- **⚡ Preset:** {depth.capitalize()}\n"
+            f"- **Status:** Drafting research plan, sub-questions, and skeptic checklist with local LLM…\n\n"
+            f"*(Outlining research questions before querying DuckDuckGo)*"
+        )
+
+        if not self._current_assistant_widget:
+            self._current_assistant_widget = ChatMessageWidget("assistant", init_md)
+            self.history_layout.insertWidget(
+                self.history_layout.count() - 1, self._current_assistant_widget
+            )
+        else:
+            self._current_assistant_widget.set_content(init_md, is_final=False)
+
+        self._pending_research_topic = question
+        self._pending_research_url = url
+        self._pending_research_model = model
+        self._pending_research_num_ctx = num_ctx
+
+        rw = self._active_research_worker = ResearchWorker(
+            url, model, topic=question,
+            num_ctx=num_ctx,
+            depth=depth,
+            stage="auto" if auto_approve else "plan",
+            auto_approve=auto_approve,
+            settings=self._settings,
+            parent=self,
+        )
+        rw.plan_ready.connect(self._on_research_plan_ready)
+        rw.progress.connect(self._on_research_progress_detailed)
+        rw.status_message.connect(self._on_research_progress)
+        rw.finished.connect(self._on_research_finished)
+        rw.error.connect(self._on_worker_error)
+        rw.start()
+        self._scroll_to_bottom(force=True)
+
+    @Slot(object, str)
+    def _on_research_plan_ready(self, plan: Any, project_id: str) -> None:
+        self._pending_research_plan = plan
+        self._pending_research_project_id = project_id
+        auto_approve = bool(self._settings.get("auto_approve_research_plans", False))
+
+        self.research_plan_panel.set_plan(plan)
+
+        sq_bullets = "\n".join(
+            f"{i}. **{sq.question}**"
+            for i, sq in enumerate(plan.sub_questions, 1)
+        )
+        chk = plan.skeptic_checklist or {}
+        myths = chk.get("myths", [])
+        myths_str = ", ".join(myths) if myths else "Standard bias & empirical verification"
+
+        if auto_approve:
+            self.top_bar.show_status("📋 Research plan approved — starting web search & execution…")
+            msg = (
+                f"### 📋 Research Plan Drafted & Auto-Approved\n\n"
+                f"**Core Question:** {plan.main_question}\n\n"
+                f"**Sub-Questions Investigated ({len(plan.sub_questions)}):**\n{sq_bullets}\n\n"
+                f"- **Adversarial Skeptic Checklist:** {myths_str}\n\n"
+                f"🌐 *Web search and evidence collection in progress…*"
+            )
+            if self._current_assistant_widget:
+                self._current_assistant_widget.set_content(msg, is_final=False)
+            self._scroll_to_bottom()
+        else:
+            self.plan_stack.setCurrentWidget(self.research_plan_panel)
+            self.top_bar.show_status("📋 Research plan ready — please review and approve.")
+
+            msg = (
+                f"### 📋 Proposed Research Plan\n\n"
+                f"**Core Question:** {plan.main_question}\n\n"
+                f"**Sub-Questions to Investigate ({len(plan.sub_questions)}):**\n{sq_bullets}\n\n"
+                f"- **Adversarial Skeptic Checklist:** {myths_str}\n\n"
+                f"Click **🚀 Approve & Start Deep Research Now** below to begin, or open the **📋 Plan** tab to customize sub-questions."
+            )
+            if self._current_assistant_widget:
+                self._current_assistant_widget.set_content(msg, is_final=True)
+
+            btn_box = QWidget()
+            btn_layout = QHBoxLayout(btn_box)
+            btn_layout.setContentsMargins(0, 4, 0, 4)
+            btn_layout.setSpacing(8)
+
+            btn_approve = QPushButton("🚀 Approve & Start Deep Research Now")
+            btn_approve.setStyleSheet(
+                "QPushButton { background-color: #98c379; color: #1e1e1e; font-weight: bold; font-size: 13px; padding: 8px 18px; border-radius: 5px; }"
+                "QPushButton:hover { background-color: #87b368; }"
+            )
+            btn_edit = QPushButton("✏️ Edit in Plan Tab")
+            btn_edit.setStyleSheet(
+                "QPushButton { background-color: #2c313a; color: #abb2bf; padding: 8px 14px; border-radius: 5px; border: 1px solid #3e4451; }"
+                "QPushButton:hover { background-color: #353b45; color: #dcdcdc; }"
+            )
+
+            def _start_approved():
+                btn_approve.setEnabled(False)
+                btn_edit.setEnabled(False)
+                btn_approve.setText("⏳ Deep Research Running…")
+                self._on_research_plan_approved(plan)
+
+            btn_approve.clicked.connect(_start_approved)
+            btn_edit.clicked.connect(lambda: self.tabs.setCurrentWidget(self.plan_stack))
+
+            btn_layout.addWidget(btn_approve)
+            btn_layout.addWidget(btn_edit)
+            btn_layout.addStretch()
+
+            self.history_layout.insertWidget(self.history_layout.count() - 1, btn_box)
+            self._messages.append({"role": "assistant", "content": msg})
+            self._save_current_conversation()
+            self._scroll_to_bottom(force=True)
+
+    def _on_research_plan_approved(self, approved_plan: Any) -> None:
+        self.tabs.setCurrentIndex(0)
+        depth = self.top_bar.research_depth()
+        url = getattr(self, "_pending_research_url", "http://localhost:11434")
+        model = getattr(self, "_pending_research_model", self.top_bar.current_model())
+        num_ctx = getattr(self, "_pending_research_num_ctx", 8192)
+        topic = getattr(self, "_pending_research_topic", "")
+        pid = getattr(self, "_pending_research_project_id", "")
+
+        self.top_bar.show_status("🔬 Starting deep research execution…")
+        self._research_activity_log = [
+            "🌐 Web Access: ACTIVE (DuckDuckGo Live Search & Content Extraction)",
+            f"⚡ Depth: {depth.capitalize()}",
+            "🚀 Research plan approved — launching investigative engine…",
+        ]
+
+        start_md = (
+            f"### 🔬 Deep Research: Starting Execution\n\n"
+            f"- **🌐 Web Access:** `ACTIVE` (DuckDuckGo Live Search & Content Extraction)\n"
+            f"- **⚡ Depth:** {depth.capitalize()}\n"
+            f"- **Status:** Launching investigative engine and DuckDuckGo queries…\n\n"
+            f"#### 📋 Live Activity Feed:\n"
+            f"- 🌐 Initializing web search queries across {len(approved_plan.sub_questions)} sub-questions\n"
+        )
+        if not self._current_assistant_widget:
+            self._current_assistant_widget = ChatMessageWidget("assistant", start_md)
+            self.history_layout.insertWidget(
+                self.history_layout.count() - 1, self._current_assistant_widget
+            )
+        else:
+            self._current_assistant_widget.set_content(start_md, is_final=False)
+
+        rw = self._active_research_worker = ResearchWorker(
+            url, model, topic=topic,
+            num_ctx=num_ctx,
+            depth=depth,
+            project_id=pid,
+            plan=approved_plan,
+            stage="execute",
+            settings=self._settings,
+            parent=self,
+        )
+        rw.progress.connect(self._on_research_progress_detailed)
+        rw.status_message.connect(self._on_research_progress)
+        rw.finished.connect(self._on_research_finished)
+        rw.error.connect(self._on_worker_error)
+        rw.start()
+        self._scroll_to_bottom(force=True)
+
+    @Slot(str, int, int, str, str)
+    def _on_research_progress_detailed(self, phase: str, step: int, total: int, msg: str, eta: str) -> None:
+        self.top_bar.notify_activity()
+        self.research_panel.update_active_step(phase, step, total, msg)
+        pct = int(step * 100 / max(total, 1))
+        eta_suffix = f" • {eta}" if eta else ""
+        self.top_bar.show_status(f"🔬 {phase} [{step}/{total}]: {msg}{eta_suffix}", pct)
+
+        if not hasattr(self, "_research_activity_log") or self._research_activity_log is None:
+            self._research_activity_log = []
+
+        if msg and (not self._research_activity_log or self._research_activity_log[-1] != msg):
+            self._research_activity_log.append(msg)
+
+        depth = self.top_bar.research_depth().capitalize()
+        recent_logs = self._research_activity_log[-8:]
+        log_lines = "\n".join(f"- {line}" for line in recent_logs)
+
+        card_md = (
+            f"### 🔬 Deep Research: {phase} [{step}/{total}]\n\n"
+            f"- **🌐 Web Access:** `ACTIVE` (DuckDuckGo Live Search & Content Extraction)\n"
+            f"- **⚡ Depth:** {depth}\n"
+            f"- **⏱️ Progress:** Step {step} of {total}{eta_suffix}\n"
+            f"- **Current Action:** {msg}\n\n"
+            f"#### 📋 Live Activity Feed:\n"
+            f"{log_lines}"
+        )
+        if self._current_assistant_widget:
+            self._current_assistant_widget.set_content(card_md, is_final=False)
+            self._scroll_to_bottom()
+
+    @Slot(str)
+    def _on_research_progress(self, msg: str) -> None:
+        self.top_bar.notify_activity()
+        self.top_bar.show_status(msg)
+        if hasattr(self, "_research_activity_log") and self._research_activity_log is not None:
+            if msg and (not self._research_activity_log or self._research_activity_log[-1] != msg):
+                self._research_activity_log.append(msg)
+
+    @Slot(str)
+    def _on_research_finished(self, project_id: str) -> None:
+        """Finalise the research project and present report button in chat."""
+        self._stream_flush_timer.stop()
+        self._pending_stream_dirty = False
+        self.top_bar.set_idle()
+        self.research_panel.refresh()
+
+        from core.research_store import get_project
+        proj = get_project(project_id) or {}
+        title = proj.get("title", "Research Report")
+        sources_cnt = proj.get("source_count", 0)
+
+        finish_msg = (
+            f"### 🔬 Deep Research Complete: {title}\n\n"
+            f"- **🌐 Web Access:** Completed\n"
+            f"- **Sources evaluated & verified:** {sources_cnt}\n"
+            f"- **Report sections:** 11 sections including Executive Summary, Key Findings, "
+            f"Disputed Claims, Mermaid Diagram, Glossary, and Learning Aids.\n"
+            f"- **Saved to:** Research Library tab\n"
+        )
+        if self._current_assistant_widget:
+            self._current_assistant_widget.set_content(finish_msg, is_final=True)
+
+        # Action button to view report
+        btn_open = QPushButton("📖 Open Report in Research Library")
+        btn_open.setStyleSheet(
+            "QPushButton { background-color: #61afef; color: #1e1e1e; font-weight: bold; padding: 6px 14px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #529fd8; }"
+        )
+        btn_open.clicked.connect(lambda: (self.tabs.setCurrentWidget(self.research_panel), self.research_panel.open_report(project_id)))
+        self.history_layout.insertWidget(self.history_layout.count() - 1, btn_open)
+
+        self._messages.append({"role": "assistant", "content": finish_msg})
+        self._update_token_meter()
+        self.top_bar.hide_status()
+        self._save_current_conversation()
+        self._active_research_worker = None
+        self._cleanup_workers_state()
+        self._add_retry_button()
+
+    def _resume_research(self, project_id: str) -> None:
+        """Resume an interrupted research project from the Research Library."""
+        url = self._settings.get("ollama_url", "http://localhost:11434")
+        model = self.top_bar.current_model()
+        num_ctx = resolve_num_ctx(self._settings.get("num_ctx", 8192), model)
+        self.tabs.setCurrentIndex(0)
+        self.top_bar.show_status("🔬 Resuming research from checkpoint…")
+
+        self._research_activity_log = [
+            "🌐 Web Access: ACTIVE (DuckDuckGo Live Search & Content Extraction)",
+            "🔄 Resuming research project from saved checkpoint…",
+        ]
+
+        resume_md = (
+            f"### 🔬 Deep Research: Resuming\n\n"
+            f"- **🌐 Web Access:** `ACTIVE` (DuckDuckGo Live Search & Content Extraction)\n"
+            f"- **Status:** Rehydrating sources, ledger, and notes from checkpoint…\n"
+        )
+
+        if not self._current_assistant_widget:
+            self._current_assistant_widget = ChatMessageWidget("assistant", resume_md)
+            self.history_layout.insertWidget(
+                self.history_layout.count() - 1, self._current_assistant_widget
+            )
+        else:
+            self._current_assistant_widget.set_content(resume_md, is_final=False)
+
+        rw = self._active_research_worker = ResearchWorker(
+            url, model, project_id=project_id,
+            num_ctx=num_ctx,
+            stage="resume",
+            settings=self._settings,
+            parent=self,
+        )
+        rw.progress.connect(self._on_research_progress_detailed)
+        rw.status_message.connect(self._on_research_progress)
+        rw.finished.connect(self._on_research_finished)
+        rw.error.connect(self._on_worker_error)
+        rw.start()
         self._scroll_to_bottom(force=True)
 
     def _on_classify_done(self, task_type: str, text: str, url: str, model: str, num_ctx: int) -> None:
@@ -606,25 +957,42 @@ class ChatPage(QWidget):
             w.plan_error.connect(self._on_worker_error)
             w.start()
         elif task_type == "both":
-            self.top_bar.show_status("💬 Explaining in chat & 🧠 planning project…")
-            if not self._current_assistant_widget:
-                self._current_assistant_widget = ChatMessageWidget("assistant", "")
-                self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
-            cw = self._active_chat_worker = ChatWorker(
-                url, model, list(self._messages), {"num_ctx": num_ctx},
-                self._settings.get("summarizer_model", ""), parent=self,
-            )
-            cw.token_received.connect(self._on_token_received)
-            cw.compaction_started.connect(self._on_compaction_started)
-            cw.compaction_performed.connect(self._on_compaction_performed)
-            cw.chat_finished.connect(self._on_chat_finished)
-            cw.chat_error.connect(self._on_worker_error)
-            cw.start()
+            is_low_power = bool(self._settings.get("low_power_mode", False))
+            if is_low_power:
+                self.top_bar.show_status("💬 Replying in chat (low-power: planning will run next)…")
+                if not self._current_assistant_widget:
+                    self._current_assistant_widget = ChatMessageWidget("assistant", "")
+                    self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
+                cw = self._active_chat_worker = ChatWorker(
+                    url, model, list(self._messages), {"num_ctx": num_ctx, "low_power_mode": True},
+                    self._settings.get("summarizer_model", ""), parent=self,
+                )
+                cw.token_received.connect(self._on_token_received)
+                cw.compaction_started.connect(self._on_compaction_started)
+                cw.compaction_performed.connect(self._on_compaction_performed)
+                cw.chat_finished.connect(lambda full, meta: self._start_sequential_plan(url, model, text, num_ctx, full, meta))
+                cw.chat_error.connect(self._on_worker_error)
+                cw.start()
+            else:
+                self.top_bar.show_status("💬 Explaining in chat & 🧠 planning project…")
+                if not self._current_assistant_widget:
+                    self._current_assistant_widget = ChatMessageWidget("assistant", "")
+                    self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
+                cw = self._active_chat_worker = ChatWorker(
+                    url, model, list(self._messages), {"num_ctx": num_ctx},
+                    self._settings.get("summarizer_model", ""), parent=self,
+                )
+                cw.token_received.connect(self._on_token_received)
+                cw.compaction_started.connect(self._on_compaction_started)
+                cw.compaction_performed.connect(self._on_compaction_performed)
+                cw.chat_finished.connect(self._on_chat_finished)
+                cw.chat_error.connect(self._on_worker_error)
+                cw.start()
 
-            pw = self._active_plan_worker = PlanWorker(url, model, text, num_ctx, parent=self)
-            pw.plan_ready.connect(self._on_hybrid_plan_ready)
-            pw.plan_error.connect(lambda err: None)
-            pw.start()
+                pw = self._active_plan_worker = PlanWorker(url, model, text, num_ctx, parent=self)
+                pw.plan_ready.connect(self._on_hybrid_plan_ready)
+                pw.plan_error.connect(lambda err: None)
+                pw.start()
         else:
             if not is_compaction_needed(estimate_messages_tokens(self._messages), num_ctx, threshold_ratio=0.75):
                 self.top_bar.show_status("💬 Connecting to local model…")
@@ -642,6 +1010,15 @@ class ChatPage(QWidget):
             cw.chat_error.connect(self._on_worker_error)
             cw.start()
 
+    def _start_sequential_plan(self, url: str, model: str, text: str, num_ctx: int, full_chat: str, meta: dict) -> None:
+        """Run planner sequentially after chat reply finishes in low power mode."""
+        self._on_chat_finished(full_chat, meta)
+        self.top_bar.show_status("🧠 Low-power mode: planning project…")
+        pw = self._active_plan_worker = PlanWorker(url, model, text, num_ctx, parent=self)
+        pw.plan_ready.connect(self._on_hybrid_plan_ready)
+        pw.plan_error.connect(lambda err: None)
+        pw.start()
+
     @Slot(object)
     def _on_hybrid_plan_ready(self, plan: CodingPlan) -> None:
         self.top_bar.notify_activity()
@@ -649,6 +1026,19 @@ class ChatPage(QWidget):
         self.plan_panel.set_plan(plan)
         self.plan_panel.btn_approve.setText("Approve & Start Coding")
         self.plan_panel.btn_approve.setEnabled(True)
+        if getattr(self, "_is_hybrid_mode", False) and self._current_assistant_widget:
+            footer = (
+                f"\n\n---\n### 📋 Project Plan Ready: {plan.goal} ({len(plan.steps)} steps)\n\n"
+                + "\n".join(f"- **Step {s.step}**: {s.description} → `{s.file}`" for s in plan.steps)
+                + "\n\n👉 A complete project plan has been prepared in the **📋 Plan** tab! Switch to the Plan tab and click **Approve & Start Coding** whenever you're ready to build."
+            )
+            curr = self._current_assistant_widget.get_content()
+            if "📋 Project Plan Ready" not in curr:
+                updated = curr + footer
+                self._current_assistant_widget.set_content(updated, is_final=True)
+                if self._messages and self._messages[-1].get("role") == "assistant":
+                    self._messages[-1]["content"] = updated
+            self._is_hybrid_mode = False
         self.top_bar.show_status(f"💬 Answer ready & 📋 Project plan prepared ({len(plan.steps)} steps) in Plan tab", 100)
         self._save_current_conversation()
 
@@ -659,6 +1049,7 @@ class ChatPage(QWidget):
         self.plan_panel.set_plan(plan)
         self.plan_panel.btn_approve.setText("Approve & Start Coding")
         self.plan_panel.btn_approve.setEnabled(True)
+        self.plan_stack.setCurrentWidget(self.plan_panel)
         self.tabs.setCurrentIndex(1)
         self.top_bar.show_status(f"📋 Plan ready ({len(plan.steps)} steps) — review in Plan tab", 100)
         plan_msg = (
@@ -700,7 +1091,8 @@ class ChatPage(QWidget):
         save_session(self._building_chat_id, plan, self._building_files, start)
         self._save_current_conversation()
 
-        max_agents = int(self._settings.get("max_agents", 2))
+        is_lp = bool(self._settings.get("low_power_mode", False))
+        max_agents = 1 if is_lp else int(self._settings.get("max_agents", 1))
         auto_test = bool(self._settings.get("auto_test", True))
 
         w = self._active_code_worker = CodeWorker(
@@ -713,6 +1105,7 @@ class ChatPage(QWidget):
             auto_test=auto_test,
             start_step=start,
             existing_files=existing,
+            low_power=is_lp,
             parent=self,
         )
         w.step_started.connect(lambda s, f: self._on_step_started(s, f, total))
@@ -928,7 +1321,8 @@ class ChatPage(QWidget):
         if hasattr(self, "_stream_flush_timer") and self._stream_flush_timer.isActive():
             self._stream_flush_timer.stop()
             self._flush_stream_ui()
-        for w in (self._active_chat_worker, self._active_plan_worker, self._classify_worker):
+        for w in (self._active_chat_worker, self._active_plan_worker,
+                  self._classify_worker, self._active_research_worker):
             if w and w.isRunning():
                 if hasattr(w, "stop"):
                     w.stop()
@@ -936,6 +1330,7 @@ class ChatPage(QWidget):
         self._active_chat_worker = None
         self._active_plan_worker = None
         self._classify_worker = None
+        self._active_research_worker = None
         self._current_assistant_widget = None
 
     def _stop_generation(self) -> None:
@@ -969,6 +1364,7 @@ class ChatPage(QWidget):
         self._active_chat_worker = None
         self._active_plan_worker = None
         self._classify_worker = None
+        self._active_research_worker = None
         self._current_assistant_widget = None
 
     def _save_current_conversation(self) -> None:
@@ -1026,6 +1422,8 @@ class ChatPage(QWidget):
     def _open_settings(self) -> None:
         if SettingsDialog(self._settings, self._models, parent=self).exec():
             self._on_model_changed(self.top_bar.current_model())
+            # Re-apply internet access state after settings change
+            self.top_bar.set_internet_access(bool(self._settings.get("internet_access", False)))
 
     def stop_workers(self) -> None:
         self._stop_generation()

@@ -17,6 +17,10 @@ skills_dir = root_dir / "skills"
 if skills_dir.exists():
     datas.append((str(skills_dir), "skills"))
 
+assets_dir = root_dir / "assets"
+if assets_dir.exists():
+    datas.append((str(assets_dir), "assets"))
+
 icon_path = None
 for candidate in ("Favicon.ico", "favicon.ico", "icon.png"):
     cand_path = root_dir / candidate
@@ -34,6 +38,9 @@ a = Analysis(
         "PySide6.QtCore",
         "PySide6.QtGui",
         "PySide6.QtWidgets",
+        "PySide6.QtWebEngineWidgets",
+        "PySide6.QtWebEngineCore",
+        "markdown_it",
         "httpx",
         "platformdirs",
         "core",
@@ -51,6 +58,12 @@ a = Analysis(
         "core.installer",
         "core.prompts",
         "core.assets",
+        "core.web_research",
+        "core.research_store",
+        "core.research_planner",
+        "core.research_budget",
+        "core.research_engine",
+        "core.research_writer",
         "ui",
         "ui.main_window",
         "ui.chat_page",
@@ -58,6 +71,9 @@ a = Analysis(
         "ui.chat_top_bar",
         "ui.message_widget",
         "ui.plan_panel",
+        "ui.research_panel",
+        "ui.research_plan_panel",
+        "ui.report_viewer",
         "ui.artifacts_panel",
         "ui.settings_dialog",
         "ui.setup_wizard",
@@ -66,6 +82,7 @@ a = Analysis(
         "workers.chat_worker",
         "workers.code_worker",
         "workers.plan_worker",
+        "workers.research_worker",
         "workers.setup_worker",
         "workers.install_worker",
         "workers.pull_worker",

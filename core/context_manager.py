@@ -153,6 +153,8 @@ def generate_summary(
     messages_to_summarize: list[dict[str, str]],
     stop_flag: Callable[[], bool] | None = None,
     timeout_seconds: float = 6.0,
+    num_ctx: int = 8192,
+    client: OllamaClient | None = None,
 ) -> str:
     """Call Ollama to generate a concise summary with strict 6s timeout and instant extractive fallback."""
     if not messages_to_summarize:
@@ -174,25 +176,32 @@ def generate_summary(
         {"role": "user", "content": prompt},
     ]
 
-    import os
     import time
-    client = OllamaClient(ollama_url)
-    collected: list[str] = []
+    from core.storage import get_configured_threads
 
-    optimal_threads = min(8, max(2, os.cpu_count() or 4))
+    own_client = False
+    if client is None:
+        client = OllamaClient(ollama_url)
+        own_client = True
+
+    collected: list[str] = []
     start_time = time.time()
+
+    summ_opts: dict[str, Any] = {
+        "num_ctx": num_ctx,
+        "num_predict": 90,
+        "temperature": 0.2,
+        "top_p": 0.9,
+    }
+    threads = get_configured_threads()
+    if threads is not None:
+        summ_opts["num_thread"] = threads
 
     try:
         for chunk in client.chat_stream(
             model=model,
             messages=req_messages,
-            options={
-                "num_ctx": 2048,
-                "num_predict": 90,
-                "temperature": 0.2,
-                "top_p": 0.9,
-                "num_thread": optimal_threads,
-            },
+            options=summ_opts,
             stop_flag=stop_flag,
         ):
             if stop_flag and stop_flag():
@@ -210,7 +219,8 @@ def generate_summary(
     except Exception:
         return fallback
     finally:
-        client.close()
+        if own_client:
+            client.close()
 
     result = "".join(collected).strip()
     return result if result else fallback

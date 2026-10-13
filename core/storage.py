@@ -76,10 +76,211 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "num_ctx": 8192,
     "coding_mode": "auto",        # 'auto' (AI decides), 'code', or 'chat'
     "max_continuations": 8,
-    "max_agents": 2,              # Concurrent worker agents for code generation
+    "max_agents": 1,              # Default 1 worker agent for lower laptop load
     "auto_test": True,            # Automatically test and self-heal generated code
     "setup_done": False,          # True after first successful setup.
+    "low_power_mode": False,      # Low-Power Mode for reduced CPU, RAM, and VRAM
+    "use_model_summaries": False, # False = fast extractive compaction (zero LLM calls)
+    "keep_alive": "3m",           # Time to keep model warm in memory
+    "num_thread": None,           # None = let Ollama choose optimal threads
+    "internet_access": False,     # OFF by default — web research is opt-in only
+    "auto_approve_research_plans": False, # Auto-approve deep research plans
 }
+
+
+
+def get_system_ram_gb() -> float:
+    """Return total physical RAM in gigabytes using psutil if available, otherwise OS fallback."""
+    try:
+        import psutil
+        return psutil.virtual_memory().total / (1024 ** 3)
+    except Exception:
+        pass
+    try:
+        import sys
+        if sys.platform == "win32":
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return stat.ullTotalPhys / (1024 ** 3)
+        elif sys.platform.startswith("linux"):
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        parts = line.split()
+                        return float(parts[1]) / (1024 * 1024)
+        elif sys.platform == "darwin":
+            import subprocess
+            out = subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip()
+            return float(out) / (1024 ** 3)
+    except Exception:
+        pass
+    return 8.0
+
+
+def get_available_ram_gb() -> float:
+    """Return available physical RAM in gigabytes using psutil if available, otherwise OS fallback."""
+    try:
+        import psutil
+        return psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        pass
+    try:
+        import sys
+        if sys.platform == "win32":
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return stat.ullAvailPhys / (1024 ** 3)
+        elif sys.platform.startswith("linux"):
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        parts = line.split()
+                        return float(parts[1]) / (1024 * 1024)
+    except Exception:
+        pass
+    return get_system_ram_gb() * 0.5
+
+
+def calculate_auto_num_ctx(
+    available_ram_gb: float,
+    model_max_ctx: int = 8192,
+    low_power: bool = False,
+) -> int:
+    """Calculate optimal num_ctx based on available RAM and model limit.
+
+    Never exceeds model_max_ctx.
+    """
+    if low_power:
+        recommended = 2048 if available_ram_gb < 6 else 4096
+    elif available_ram_gb >= 16:
+        recommended = 16384
+    elif available_ram_gb >= 8:
+        recommended = 8192
+    elif available_ram_gb >= 4:
+        recommended = 4096
+    else:
+        recommended = 2048
+
+    if model_max_ctx and model_max_ctx > 0:
+        return max(1024, min(recommended, model_max_ctx))
+    return max(1024, recommended)
+
+
+def resolve_num_ctx(
+    settings: dict[str, Any] | None = None,
+    model_max_ctx: int = 8192,
+    low_power: bool | None = None,
+) -> int:
+    """Resolve effective num_ctx: respects user setting, clamped never above model's real limit."""
+    if settings is None:
+        try:
+            settings = load_settings()
+        except Exception:
+            settings = {}
+
+    is_lp = settings.get("low_power_mode", False) if low_power is None else low_power
+
+    # If low_power is active and user has not customized num_ctx, use low_power auto
+    user_val = settings.get("num_ctx")
+    avail_ram = get_available_ram_gb()
+
+    if user_val is not None:
+        try:
+            val_int = int(user_val)
+            if val_int > 0:
+                if is_lp and val_int > 4096:
+                    val_int = 4096
+                if model_max_ctx and model_max_ctx > 0:
+                    return max(1024, min(val_int, model_max_ctx))
+                return max(1024, val_int)
+        except (ValueError, TypeError):
+            pass
+
+    return calculate_auto_num_ctx(avail_ram, model_max_ctx, low_power=is_lp)
+
+
+def get_configured_threads(settings: dict[str, Any] | None = None) -> int | None:
+    """Return user-configured num_thread from settings, or None to let Ollama choose."""
+    if settings is None:
+        try:
+            settings = load_settings()
+        except Exception:
+            settings = {}
+    val = settings.get("num_thread")
+    if val is not None:
+        try:
+            val_int = int(val)
+            if val_int > 0:
+                return val_int
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def parse_keep_alive_seconds(val: str | int | float) -> int:
+    """Parse keep_alive string like '3m', '1m', '90s', or integer into seconds."""
+    if isinstance(val, (int, float)):
+        return max(10, int(val))
+    val_str = str(val).strip().lower()
+    if val_str.endswith("m"):
+        try:
+            return max(10, int(float(val_str[:-1]) * 60))
+        except ValueError:
+            return 180
+    if val_str.endswith("s"):
+        try:
+            return max(10, int(float(val_str[:-1])))
+        except ValueError:
+            return 180
+    try:
+        return max(10, int(val_str))
+    except ValueError:
+        return 180
+
+
+def get_effective_keep_alive(settings: dict[str, Any] | None = None) -> str:
+    """Return effective keep_alive duration string (e.g. '1m' when low_power_mode is on)."""
+    if settings is None:
+        try:
+            settings = load_settings()
+        except Exception:
+            settings = {}
+    if settings.get("low_power_mode", False):
+        return "1m"
+    return str(settings.get("keep_alive", "3m")).strip() or "3m"
+
+
+def get_effective_keep_alive_seconds(settings: dict[str, Any] | None = None) -> int:
+    """Return effective keep_alive in seconds (60 when low_power_mode is on)."""
+    return parse_keep_alive_seconds(get_effective_keep_alive(settings))
 
 
 def load_settings() -> dict[str, Any]:

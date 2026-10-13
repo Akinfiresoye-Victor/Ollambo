@@ -27,6 +27,21 @@ SUGGESTED_MODELS: list[dict[str, str]] = [
 ]
 
 
+def check_hardware_capabilities() -> dict[str, Any]:
+    """Check machine hardware (RAM) and recommend low-power settings if 8 GB or less."""
+    from core.storage import get_system_ram_gb
+    total_ram = get_system_ram_gb()
+    is_low_ram = total_ram <= 8.5
+    # Small quantized model (1.5B to 3B) from SUGGESTED_MODELS
+    rec_model = "qwen2.5-coder:1.5b" if is_low_ram else "qwen2.5-coder:7b"
+    return {
+        "total_ram_gb": round(total_ram, 1),
+        "is_low_ram": is_low_ram,
+        "recommended_model": rec_model,
+        "suggest_low_power": is_low_ram,
+    }
+
+
 class SetupStatus(NamedTuple):
     """Result of a single setup check."""
     ok: bool

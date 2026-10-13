@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -22,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.installer import InstallPlan, get_install_plan
-from core.setup_checker import SUGGESTED_MODELS
+from core.setup_checker import SUGGESTED_MODELS, check_hardware_capabilities
 from ui.terminal_widget import TerminalWidget
 from workers.install_worker import InstallWorker
 from workers.pull_worker import PullWorker
@@ -119,6 +120,23 @@ class SetupWizard(QWidget):
         for m in SUGGESTED_MODELS:
             self._model_combo.addItem(m["desc"], m["name"])
         model_layout.addWidget(self._model_combo)
+
+        # Hardware check recommendation for first run
+        hw = check_hardware_capabilities()
+        if hw["suggest_low_power"]:
+            rec_idx = self._model_combo.findData(hw["recommended_model"])
+            if rec_idx >= 0:
+                self._model_combo.setCurrentIndex(rec_idx)
+            hw_label = QLabel(
+                f"💡 System check: {hw['total_ram_gb']} GB RAM detected (≤8 GB).\n"
+                f"Suggested: Low-Power Mode and lightweight model '{hw['recommended_model']}'."
+            )
+            hw_label.setStyleSheet("color: #e5c07b; font-size: 11px; padding: 4px; background: #2c2820; border-radius: 4px;")
+            model_layout.addWidget(hw_label)
+
+        self._low_power_check = QCheckBox("Enable Low-Power Mode (optimizes CPU, RAM & VRAM)")
+        self._low_power_check.setChecked(hw["suggest_low_power"])
+        model_layout.addWidget(self._low_power_check)
 
         self._btn_pull = QPushButton("Download selected model")
         self._btn_pull.clicked.connect(self._on_pull_clicked)
@@ -284,6 +302,11 @@ class SetupWizard(QWidget):
 
     def _on_continue(self) -> None:
         models = getattr(self, "_discovered_models", [])
+        if hasattr(self, "_low_power_check"):
+            from core.storage import load_settings, save_settings
+            st = load_settings()
+            st["low_power_mode"] = self._low_power_check.isChecked()
+            save_settings(st)
         self.setup_complete.emit(models, self._server_started_by_us)
 
     # ── Cleanup ───────────────────────────────────────────────────────

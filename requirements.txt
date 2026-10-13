@@ -4,3 +4,11 @@
 PySide6==6.12.0
 httpx==0.28.1
 platformdirs==4.3.6
+
+# Optional web research dependencies (needed for Research mode).
+# Ollambo is OFFLINE by default. Enable research via Settings > Internet Access.
+ddgs>=9.16.0
+trafilatura>=2.3.0
+lxml>=6.1.0
+beautifulsoup4>=4.15.0
+markdown-it-py==4.2.0

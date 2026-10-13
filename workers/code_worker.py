@@ -18,6 +18,7 @@ from PySide6.QtCore import QThread, Signal
 
 from core.code_tester import test_and_repair
 from core.code_writer import generate_single_file
+from core.ollama_client import OllamaClient
 from core.planner import CodingPlan, PlanStep
 
 
@@ -50,10 +51,11 @@ class CodeWorker(QThread):
         num_ctx: int = 8192,
         max_continuations: int = 8,
         *,
-        max_agents: int = 2,
+        max_agents: int = 1,
         auto_test: bool = True,
         start_step: int = 1,
         existing_files: dict[str, str] | None = None,
+        low_power: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -62,7 +64,8 @@ class CodeWorker(QThread):
         self._plan = plan
         self._num_ctx = num_ctx
         self._max_continuations = max_continuations
-        self._max_agents = max(1, max_agents)
+        self._low_power = low_power
+        self._max_agents = 1 if low_power else max(1, max_agents)
         self._auto_test = auto_test
         self._start_step = start_step
         self._stop = False
@@ -90,63 +93,70 @@ class CodeWorker(QThread):
             num_workers = min(self._max_agents, len(steps_to_run))
 
             def agent_worker(agent_id: int) -> None:
-                while not self._stop:
-                    try:
-                        step = work_queue.get_nowait()
-                    except Empty:
-                        break
+                client = OllamaClient(self._url)
+                try:
+                    while not self._stop:
+                        try:
+                            step = work_queue.get_nowait()
+                        except Empty:
+                            break
 
-                    try:
-                        self.step_started.emit(step.step, step.file)
+                        try:
+                            self.step_started.emit(step.step, step.file)
 
-                        with self._lock:
-                            curr_files = dict(self._generated_files)
+                            with self._lock:
+                                curr_files = dict(self._generated_files)
 
-                        code = generate_single_file(
-                            ollama_url=self._url,
-                            model=self._model,
-                            plan=self._plan,
-                            step=step,
-                            generated_files=curr_files,
-                            num_ctx=self._num_ctx,
-                            max_continuations=self._max_continuations,
-                            on_progress=lambda part, max_p: self.part_started.emit(step.file, part, max_p),
-                            stop_flag=lambda: self._stop,
-                        )
-
-                        if self._stop:
-                            work_queue.task_done()
-                            return
-
-                        # Self-healing test phase if enabled
-                        if self._auto_test and code:
-                            self.test_progress.emit(step.file, f"🧪 Agent {agent_id}: Testing `{step.file}`…")
-                            code, passed, msg = test_and_repair(
+                            code = generate_single_file(
                                 ollama_url=self._url,
                                 model=self._model,
-                                filename=step.file,
-                                code=code,
-                                step_desc=step.description,
-                                all_files=curr_files,
+                                plan=self._plan,
+                                step=step,
+                                generated_files=curr_files,
                                 num_ctx=self._num_ctx,
+                                max_continuations=self._max_continuations,
+                                on_progress=lambda part, max_p: self.part_started.emit(step.file, part, max_p),
                                 stop_flag=lambda: self._stop,
-                                on_repair_status=lambda s: self.test_progress.emit(step.file, s),
+                                client=client,
                             )
 
-                        if self._stop:
+                            if self._stop:
+                                work_queue.task_done()
+                                return
+
+                            # Self-healing test phase if enabled
+                            if self._auto_test and code:
+                                self.test_progress.emit(step.file, f"🧪 Agent {agent_id}: Testing `{step.file}`…")
+                                code, passed, msg = test_and_repair(
+                                    ollama_url=self._url,
+                                    model=self._model,
+                                    filename=step.file,
+                                    code=code,
+                                    step_desc=step.description,
+                                    all_files=curr_files,
+                                    num_ctx=self._num_ctx,
+                                    stop_flag=lambda: self._stop,
+                                    on_repair_status=lambda s: self.test_progress.emit(step.file, s),
+                                    client=client,
+                                    low_power=self._low_power,
+                                )
+
+                            if self._stop:
+                                work_queue.task_done()
+                                return
+
+                            with self._lock:
+                                self._generated_files[step.file] = code
+                                step.completed = True
+
+                            self.file_completed.emit(step.file, code, step.step)
+
+                        except Exception as e:
+                            self.worker_error.emit(f"Error on `{step.file}`: {e}")
+                        finally:
                             work_queue.task_done()
-                            return
-
-                        with self._lock:
-                            self._generated_files[step.file] = code
-                            step.completed = True
-
-                        self.file_completed.emit(step.file, code, step.step)
-
-                    except Exception as e:
-                        self.worker_error.emit(f"Error on `{step.file}`: {e}")
-                    finally:
-                        work_queue.task_done()
+                finally:
+                    client.close()
 
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
                 futures = [executor.submit(agent_worker, i + 1) for i in range(num_workers)]

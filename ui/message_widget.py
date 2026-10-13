@@ -116,6 +116,10 @@ class CodeBlockWidget(QFrame):
             QTimer.singleShot(1500, lambda: self.copy_btn.setText("Copy"))
 
 
+_CODE_BLOCK_PATTERN = re.compile(r"```([a-zA-Z0-9_\-\+]*)\n?(.*?)```", re.DOTALL)
+_UNCLOSED_FENCE_PATTERN = re.compile(r"```([a-zA-Z0-9_\-\+]*)\n?(.*)$", re.DOTALL)
+
+
 class ChatMessageWidget(QFrame):
     """Displays a single user or assistant chat message with formatted Markdown and stable streaming."""
 
@@ -125,6 +129,9 @@ class ChatMessageWidget(QFrame):
         self._content = content
         self._blocks: list[dict] = []
         self._placeholder: QLabel | None = None
+        self._parsed_raw = ""
+        self._closed_segments: list[dict] = []
+        self._closed_idx = 0
 
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -198,74 +205,91 @@ class ChatMessageWidget(QFrame):
             self._placeholder = None
 
         segments = self._parse_segments(new_content)
-        self._sync_segments_to_ui(segments)
+        self._sync_segments_to_ui(segments, is_final=is_final)
 
         self.updateGeometry()
 
     def _parse_segments(self, text: str) -> list[dict]:
-        """Parse raw markdown text into ordered list of text and code segments."""
-        segments: list[dict] = []
-        pattern = re.compile(r"```([a-zA-Z0-9_\-\+]*)\n?(.*?)```", re.DOTALL)
-        last_idx = 0
+        """Parse raw markdown into segments, caching completed blocks to avoid regex over unchanged text."""
+        # Reset cache if text does not extend the previously parsed closed prefix
+        if not text.startswith(self._parsed_raw[:self._closed_idx]):
+            self._closed_segments.clear()
+            self._closed_idx = 0
 
-        for match in pattern.finditer(text):
-            start, end = match.span()
-            pre_text = text[last_idx:start]
-            if pre_text.strip():
-                segments.append({"type": "text", "content": pre_text.strip()})
+        self._parsed_raw = text
 
-            lang = match.group(1).strip()
-            code = match.group(2)
-            segments.append({"type": "code", "lang": lang, "content": code})
-            last_idx = end
+        # Only scan from the last unclosed point if fences might be present
+        if "```" in text[self._closed_idx:]:
+            last_idx = self._closed_idx
+            for match in _CODE_BLOCK_PATTERN.finditer(text, self._closed_idx):
+                start, end = match.span()
+                pre_text = text[last_idx:start]
+                if pre_text.strip():
+                    self._closed_segments.append({"type": "text", "content": pre_text.strip()})
 
-        # Remaining text: check if contains an unclosed code fence ```
-        tail = text[last_idx:]
+                lang = match.group(1).strip()
+                code = match.group(2)
+                self._closed_segments.append({"type": "code", "lang": lang, "content": code})
+                last_idx = end
+                self._closed_idx = end
+
+        # Parse remaining tail
+        tail = text[self._closed_idx:]
+        tail_segments: list[dict] = []
         if tail:
-            unclosed_match = re.search(r"```([a-zA-Z0-9_\-\+]*)\n?(.*)$", tail, re.DOTALL)
-            if unclosed_match:
-                pre_code = tail[: unclosed_match.start()].strip()
-                if pre_code:
-                    segments.append({"type": "text", "content": pre_code})
-                lang = unclosed_match.group(1).strip()
-                code = unclosed_match.group(2)
-                segments.append({"type": "code", "lang": lang, "content": code})
+            if "```" in tail:
+                unclosed_match = _UNCLOSED_FENCE_PATTERN.search(tail)
+                if unclosed_match:
+                    pre_code = tail[: unclosed_match.start()].strip()
+                    if pre_code:
+                        tail_segments.append({"type": "text", "content": pre_code})
+                    lang = unclosed_match.group(1).strip()
+                    code = unclosed_match.group(2)
+                    tail_segments.append({"type": "code", "lang": lang, "content": code})
+                elif tail.strip():
+                    tail_segments.append({"type": "text", "content": tail.strip()})
             elif tail.strip():
-                segments.append({"type": "text", "content": tail.strip()})
+                tail_segments.append({"type": "text", "content": tail.strip()})
 
-        return segments
+        return list(self._closed_segments) + tail_segments
 
-    def _sync_segments_to_ui(self, segments: list[dict]) -> None:
-        """Sync parsed segments into UI widgets in-place without deleting intact blocks."""
-        # Update existing blocks or replace mismatched types
+    def _sync_segments_to_ui(self, segments: list[dict], is_final: bool = False) -> None:
+        """Sync segments to widgets, updating only the last changing block during streaming."""
+        # Align widget list size and types
         for i, seg in enumerate(segments):
             if i < len(self._blocks):
                 curr = self._blocks[i]
                 if curr["type"] == seg["type"]:
-                    # In-place update
-                    if seg["type"] == "text":
-                        if curr["content"] != seg["content"]:
+                    # Type matches, update content only if this is the last block or if final
+                    if is_final or i == len(segments) - 1:
+                        if curr["type"] == "text":
+                            if curr["content"] != seg["content"] or is_final:
+                                curr["content"] = seg["content"]
+                                if is_final:
+                                    curr["widget"].setTextFormat(Qt.TextFormat.RichText)
+                                    curr["widget"].setText(markdown_to_html(seg["content"]))
+                                else:
+                                    curr["widget"].setTextFormat(Qt.TextFormat.PlainText)
+                                    curr["widget"].setText(seg["content"])
+                                curr["widget"].update()
+                        else:  # code
                             curr["content"] = seg["content"]
-                            curr["widget"].setText(markdown_to_html(seg["content"]))
-                            curr["widget"].update()
-                    else:  # code
-                        curr["content"] = seg["content"]
-                        curr["lang"] = seg.get("lang", "")
-                        curr["widget"].update_code(seg["content"], seg.get("lang", ""))
+                            curr["lang"] = seg.get("lang", "")
+                            curr["widget"].update_code(seg["content"], seg.get("lang", ""))
                     continue
                 else:
                     # Type changed -> replace widget at position i
                     self._content_layout.removeWidget(curr["widget"])
                     curr["widget"].deleteLater()
-                    new_w = self._create_segment_widget(seg)
+                    new_w = self._create_segment_widget(seg, is_final=is_final)
                     self._content_layout.insertWidget(i, new_w)
                     self._blocks[i] = {"type": seg["type"], "widget": new_w, "content": seg["content"]}
                     if seg["type"] == "code":
                         self._blocks[i]["lang"] = seg.get("lang", "")
                     continue
 
-            # Need to append new block
-            new_w = self._create_segment_widget(seg)
+            # Append new block
+            new_w = self._create_segment_widget(seg, is_final=is_final)
             self._content_layout.addWidget(new_w)
             block_data = {"type": seg["type"], "widget": new_w, "content": seg["content"]}
             if seg["type"] == "code":
@@ -278,19 +302,31 @@ class ChatMessageWidget(QFrame):
             self._content_layout.removeWidget(extra["widget"])
             extra["widget"].deleteLater()
 
-    def _create_segment_widget(self, seg: dict) -> QWidget:
+        # If final, ensure all earlier text blocks receive full markdown formatting
+        if is_final:
+            for b in self._blocks:
+                if b["type"] == "text":
+                    b["widget"].setTextFormat(Qt.TextFormat.RichText)
+                    b["widget"].setText(markdown_to_html(b["content"]))
+                    b["widget"].update()
+
+    def _create_segment_widget(self, seg: dict, is_final: bool = True) -> QWidget:
         """Create a QLabel for text or a CodeBlockWidget for code."""
         if seg["type"] == "text":
             lbl = QLabel()
             lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             lbl.setWordWrap(True)
-            lbl.setTextFormat(Qt.TextFormat.RichText)
             lbl.setOpenExternalLinks(True)
             lbl.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse
             )
             lbl.setStyleSheet("color: #abb2bf; font-size: 13px; line-height: 1.45;")
-            lbl.setText(markdown_to_html(seg["content"]))
+            if is_final:
+                lbl.setTextFormat(Qt.TextFormat.RichText)
+                lbl.setText(markdown_to_html(seg["content"]))
+            else:
+                lbl.setTextFormat(Qt.TextFormat.PlainText)
+                lbl.setText(seg["content"])
             return lbl
         else:
             return CodeBlockWidget(seg["content"], language=seg.get("lang", ""))
@@ -301,3 +337,6 @@ class ChatMessageWidget(QFrame):
             self._content_layout.removeWidget(b["widget"])
             b["widget"].deleteLater()
         self._blocks.clear()
+        self._parsed_raw = ""
+        self._closed_segments.clear()
+        self._closed_idx = 0

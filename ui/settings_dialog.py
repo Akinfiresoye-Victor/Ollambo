@@ -37,7 +37,7 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Ollambo Settings")
-        self.resize(480, 290)
+        self.resize(480, 310)
         from core.assets import get_app_icon
         if not (icon := get_app_icon()).isNull():
             self.setWindowIcon(icon)
@@ -86,13 +86,37 @@ class SettingsDialog(QDialog):
         # 5. Parallel sub-agents
         self.max_agents_spin = QSpinBox()
         self.max_agents_spin.setRange(1, 6)
-        self.max_agents_spin.setValue(int(self._settings.get("max_agents", 2)))
+        self.max_agents_spin.setValue(int(self._settings.get("max_agents", 1)))
         form.addRow("Parallel Sub-Agents:", self.max_agents_spin)
 
         # 6. Automated testing & self-healing
         self.auto_test_check = QCheckBox("Automatically test code and auto-fix bugs")
         self.auto_test_check.setChecked(bool(self._settings.get("auto_test", True)))
         form.addRow("Self-Healing Tests:", self.auto_test_check)
+
+        # 7. Compaction: Use model for smarter summaries
+        self.smarter_summaries_check = QCheckBox("Use model for smarter summaries")
+        self.smarter_summaries_check.setChecked(bool(self._settings.get("use_model_summaries", False)))
+        form.addRow("Compaction Summaries:", self.smarter_summaries_check)
+
+        # 8. Low-Power Mode
+        self.low_power_check = QCheckBox("Enable Low-Power Mode (conserves CPU, RAM & VRAM)")
+        self.low_power_check.setChecked(bool(self._settings.get("low_power_mode", False)))
+        form.addRow("Low-Power Mode:", self.low_power_check)
+
+        # 9. Keep-Alive duration
+        self.keep_alive_edit = QLineEdit(str(self._settings.get("keep_alive", "3m")))
+        form.addRow("Keep-Alive Duration:", self.keep_alive_edit)
+
+        # 10. Internet access (OFF by default for privacy)
+        self.internet_access_check = QCheckBox("Allow internet access for Web Research mode")
+        self.internet_access_check.setChecked(bool(self._settings.get("internet_access", False)))
+        form.addRow("Internet Access:", self.internet_access_check)
+
+        # 11. Auto-approve research plans (default off)
+        self.auto_approve_research_check = QCheckBox("Auto-approve research plans without review")
+        self.auto_approve_research_check.setChecked(bool(self._settings.get("auto_approve_research_plans", False)))
+        form.addRow("Research Plans:", self.auto_approve_research_check)
 
         layout.addLayout(form)
         layout.addSpacing(10)
@@ -120,6 +144,11 @@ class SettingsDialog(QDialog):
         self._settings["num_ctx"] = self.num_ctx_spin.value()
         self._settings["max_agents"] = self.max_agents_spin.value()
         self._settings["auto_test"] = self.auto_test_check.isChecked()
+        self._settings["use_model_summaries"] = self.smarter_summaries_check.isChecked()
+        self._settings["low_power_mode"] = self.low_power_check.isChecked()
+        self._settings["keep_alive"] = self.keep_alive_edit.text().strip() or "3m"
+        self._settings["internet_access"] = self.internet_access_check.isChecked()
+        self._settings["auto_approve_research_plans"] = self.auto_approve_research_check.isChecked()
 
         save_settings(self._settings)
         self.accept()
