@@ -2,12 +2,24 @@
 
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 root_dir = Path.cwd()
 
 # Bundle application icon and assets
 datas = []
+binaries = []
+hiddenimports_extra = []
+for pkg in ("ddgs", "primp", "trafilatura", "courlan", "htmldate", "justext", "lxml", "bs4"):
+    try:
+        pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(pkg)
+        datas.extend(pkg_datas)
+        binaries.extend(pkg_binaries)
+        hiddenimports_extra.extend(pkg_hiddenimports)
+    except Exception:
+        pass
+
 for asset_name in ("Favicon.ico", "favicon.ico", "icon.png"):
     p = root_dir / asset_name
     if p.exists():
@@ -31,7 +43,7 @@ for candidate in ("Favicon.ico", "favicon.ico", "icon.png"):
 a = Analysis(
     ["main.py"],
     pathex=[str(root_dir)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=[
         "PySide6",
@@ -43,6 +55,14 @@ a = Analysis(
         "markdown_it",
         "httpx",
         "platformdirs",
+        "ddgs",
+        "primp",
+        "trafilatura",
+        "courlan",
+        "htmldate",
+        "justext",
+        "lxml",
+        "bs4",
         "core",
         "core.ollama_client",
         "core.planner",
@@ -59,6 +79,7 @@ a = Analysis(
         "core.prompts",
         "core.assets",
         "core.web_research",
+        "core.chat_title",
         "core.research_store",
         "core.research_planner",
         "core.research_budget",
@@ -83,15 +104,17 @@ a = Analysis(
         "workers.code_worker",
         "workers.plan_worker",
         "workers.research_worker",
+        "workers.web_answer_worker",
+        "workers.title_worker",
         "workers.setup_worker",
         "workers.install_worker",
         "workers.pull_worker",
         "workers.models_worker",
-    ],
+    ] + hiddenimports_extra,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "numpy", "scipy", "pytest", "unittest"],
+    excludes=["tkinter", "matplotlib", "numpy", "scipy", "pytest"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

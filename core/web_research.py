@@ -108,6 +108,46 @@ def is_private_address(url: str) -> bool:
         return True  # fail-safe: treat unknown as private
 
 
+def normalize_url(text: str) -> str:
+    """Normalize a URL or bare domain into a valid https URL."""
+    s = text.strip()
+    if not s:
+        return ""
+    if re.match(r"^https?://", s, re.IGNORECASE):
+        return s
+    return f"https://{s}"
+
+
+def extract_urls(text: str) -> list[str]:
+    """Extract and normalize all full URLs and bare domains from text.
+    Returns list of normalized https URLs in order with duplicates removed.
+    """
+    if not text:
+        return []
+    url_pattern = re.compile(
+        r"(?:https?://[^\s<>\"'()]+)|(?:\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?:/[^\s<>\"'()]*)?)"
+    )
+    raw_matches = url_pattern.findall(text)
+    results: list[str] = []
+    seen: set[str] = set()
+    for m in raw_matches:
+        m_clean = re.sub(r"[\.,;:!?)]+$", "", m).strip()
+        if not m_clean:
+            continue
+        parsed = urlparse(m_clean if "://" in m_clean else f"http://{m_clean}")
+        hostname = parsed.hostname or ""
+        if "." not in hostname:
+            continue
+        tld = hostname.split(".")[-1]
+        if not tld.isalpha() or len(tld) < 2:
+            continue
+        norm = normalize_url(m_clean)
+        if norm not in seen:
+            seen.add(norm)
+            results.append(norm)
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
@@ -115,28 +155,36 @@ def is_private_address(url: str) -> bool:
 
 def search(query: str, max_results: int = 10) -> list[dict]:
     """DuckDuckGo search, no API key. Returns [{title, url, snippet}].
-    Returns a single error-item on failure instead of raising."""
+    Returns a single error-item on failure instead of raising.
+    Retries once on exception after short backoff. Does not cache empty results."""
     key = _cache_key(f"search:{query}:{max_results}")
     cached = _cache_get(key)
-    if cached is not None:
+    if cached is not None and cached:
         return cached
-    try:
-        from ddgs import DDGS  # type: ignore
 
-        results: list[dict] = []
-        with DDGS(timeout=15) as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                results.append(
-                    {
-                        "title": r.get("title", ""),
-                        "url": r.get("href", ""),
-                        "snippet": r.get("body", ""),
-                    }
-                )
-        _cache_set(key, results)
-        return results
-    except Exception as exc:
-        return [{"title": "Search unavailable", "url": "", "snippet": str(exc)}]
+    for attempt in range(2):
+        try:
+            from ddgs import DDGS  # type: ignore
+
+            results: list[dict] = []
+            with DDGS(timeout=15) as ddgs:
+                for r in ddgs.text(query, max_results=max_results):
+                    results.append(
+                        {
+                            "title": r.get("title", ""),
+                            "url": r.get("href", ""),
+                            "snippet": r.get("body", ""),
+                        }
+                    )
+            if results:
+                _cache_set(key, results)
+            return results
+        except Exception as exc:
+            if attempt == 0:
+                time.sleep(1.0)
+                continue
+            return [{"title": "Search unavailable", "url": "", "snippet": str(exc), "error": str(exc)}]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -149,9 +197,12 @@ _FETCH_WORKERS = 4
 
 
 def _fetch_one(url: str) -> dict | None:
-    """Fetch a single URL; returns {url, html} or None."""
-    if not url or is_private_address(url):
+    """Fetch a single URL; returns {url, html} or error dictionary."""
+    if not url:
         return None
+    if is_private_address(url):
+        return {"url": url, "html": "", "error": "Blocked private or local address"}
+
     key = _cache_key(f"fetch:{url}")
     cached = _cache_get(key)
     if cached is not None:
@@ -172,20 +223,23 @@ def _fetch_one(url: str) -> dict | None:
             headers=headers,
         ) as client:
             resp = client.get(url)
+            if resp.status_code >= 400:
+                return {"url": url, "html": "", "error": f"HTTP status {resp.status_code}"}
             ctype = resp.headers.get("content-type", "")
             if "text" not in ctype and "html" not in ctype:
-                return None
+                return {"url": url, "html": "", "error": f"Non-HTML content type: {ctype}"}
             html = resp.content[:_PAGE_SIZE_LIMIT].decode("utf-8", errors="replace")
             result = {"url": url, "html": html}
             _cache_set(key, result)
             return result
-    except Exception:
-        return None
+    except Exception as exc:
+        return {"url": url, "html": "", "error": str(exc)}
 
 
 def fetch_pages(urls: list[str], max_workers: int = _FETCH_WORKERS) -> list[dict]:
-    """Fetch multiple pages in parallel. Returns [{url, html}]."""
-    valid = [u for u in urls if u and urlparse(u).scheme in ("http", "https")]
+    """Fetch multiple pages in parallel. Returns [{url, html, ...}]."""
+    norm_urls = [normalize_url(u) if u and "://" not in u else u for u in urls]
+    valid = [u for u in norm_urls if u and urlparse(u).scheme in ("http", "https")]
     out: list[dict] = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_fetch_one, u): u for u in valid}
@@ -201,30 +255,106 @@ def fetch_pages(urls: list[str], max_workers: int = _FETCH_WORKERS) -> list[dict
 # ---------------------------------------------------------------------------
 
 
-def extract_text(html: str) -> str:
-    """Extract readable plain text from HTML via trafilatura or BeautifulSoup4."""
+def extract_text(html: str, url: str = "") -> str:
+    """Extract readable plain text from HTML via trafilatura or BeautifulSoup4.
+    If the page is JavaScript-rendered (id="root" or id="__next") and has < 200 chars,
+    extracts metadata and plainly states limited JS-rendered information.
+    """
     if not html:
         return ""
+    text = ""
     try:
         import trafilatura  # type: ignore
 
-        text = trafilatura.extract(
+        extracted = trafilatura.extract(
             html, include_comments=False, include_tables=True, no_fallback=False
         )
-        if text and len(text.strip()) > 100:
-            return text.strip()
+        if extracted and len(extracted.strip()) > 100:
+            text = extracted.strip()
     except Exception:
         pass
-    try:
-        from bs4 import BeautifulSoup  # type: ignore
 
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
-            tag.decompose()
-        text = soup.get_text(separator=" ", strip=True)
-        return re.sub(r"\s+", " ", text).strip()
-    except Exception:
-        return ""
+    if not text:
+        try:
+            from bs4 import BeautifulSoup  # type: ignore
+
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
+                tag.decompose()
+            raw = soup.get_text(separator=" ", strip=True)
+            text = re.sub(r"\s+", " ", raw).strip()
+        except Exception:
+            text = ""
+
+    # Check for JavaScript-rendered SPA (React/Next.js)
+    is_js_app = (
+        'id="root"' in html
+        or 'id="__next"' in html
+        or "id='root'" in html
+        or "id='__next'" in html
+    )
+    if len(text.strip()) < 200 and is_js_app:
+        try:
+            from bs4 import BeautifulSoup  # type: ignore
+
+            soup = BeautifulSoup(html, "html.parser")
+            title = soup.title.get_text(strip=True) if soup.title else ""
+            desc = ""
+            meta_desc = soup.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
+            if meta_desc and meta_desc.get("content"):
+                desc = meta_desc["content"].strip()
+            if not desc:
+                og_desc = soup.find("meta", attrs={"property": re.compile(r"^og:description$", re.I)})
+                if og_desc and og_desc.get("content"):
+                    desc = og_desc["content"].strip()
+
+            og_title = ""
+            og_t = soup.find("meta", attrs={"property": re.compile(r"^og:title$", re.I)})
+            if og_t and og_t.get("content"):
+                og_title = og_t["content"].strip()
+
+            noscripts = [ns.get_text(" ", strip=True) for ns in soup.find_all("noscript")]
+            noscript_text = " ".join(ns for ns in noscripts if ns).strip()
+
+            sitemap_pages: list[str] = []
+            if url:
+                try:
+                    parsed = urlparse(url)
+                    if parsed.scheme and parsed.netloc:
+                        sitemap_url = f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"
+                        if not is_private_address(sitemap_url):
+                            import httpx
+
+                            with httpx.Client(timeout=4, follow_redirects=True) as client:
+                                s_resp = client.get(sitemap_url)
+                                if s_resp.status_code == 200 and "xml" in s_resp.headers.get("content-type", ""):
+                                    locs = re.findall(r"<loc>(.*?)</loc>", s_resp.text)
+                                    sitemap_pages = [loc.strip() for loc in locs[:8]]
+                except Exception:
+                    pass
+
+            parts = [
+                "[Note: This website renders content dynamically with JavaScript (SPA / React / Next.js). "
+                "Only limited static metadata and content could be read without a browser.]"
+            ]
+            if title:
+                parts.append(f"Page Title: {title}")
+            if og_title and og_title != title:
+                parts.append(f"Site Name: {og_title}")
+            if desc:
+                parts.append(f"Description: {desc}")
+            if noscript_text:
+                parts.append(f"Noscript Content: {noscript_text[:500]}")
+            if sitemap_pages:
+                parts.append("Discovered Sitemap Pages:\n" + "\n".join(f"- {p}" for p in sitemap_pages))
+            if text:
+                parts.append(f"Extracted Snippet: {text}")
+
+            return "\n\n".join(parts)
+        except Exception:
+            pass
+
+    return text
 
 
 # ---------------------------------------------------------------------------

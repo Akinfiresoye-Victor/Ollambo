@@ -7,6 +7,7 @@ Background Builds with Persistent Sessions, and Keep-Alive Model Connection.
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from typing import Any
 
@@ -46,11 +47,14 @@ from ui.plan_panel import PlanPanel
 from ui.research_panel import ResearchPanel
 from ui.research_plan_panel import ResearchPlanPanel
 from ui.settings_dialog import SettingsDialog
+from core.web_research import extract_urls
 from workers.chat_worker import ChatWorker
 from workers.code_worker import CodeWorker
 from workers.models_worker import ModelsWorker
 from workers.plan_worker import PlanWorker
 from workers.research_worker import ResearchWorker
+from workers.web_answer_worker import WebAnswerWorker
+from workers.title_worker import TitleWorker
 
 
 class ContextLengthWorker(QThread):
@@ -131,6 +135,9 @@ class ChatPage(QWidget):
         self._settings = settings
         self._models: list[str] = []
         self._current_chat_id = str(uuid.uuid4())
+        self._current_chat_title: str | None = None
+        self._current_chat_has_ai_title: bool = False
+        self._active_title_workers: list[TitleWorker] = []
         self._messages: list[dict] = []
         self._last_prompt_eval_tokens = 0
 
@@ -331,6 +338,8 @@ class ChatPage(QWidget):
         self._stop_chat_generation()
 
         self._current_chat_id = str(uuid.uuid4())
+        self._current_chat_title = None
+        self._current_chat_has_ai_title = False
         self._messages = []
         self._last_prompt_eval_tokens = 0
         self._active_plan = None
@@ -352,6 +361,8 @@ class ChatPage(QWidget):
             # The active chat was deleted — reset to a fresh state without saving
             self._stop_chat_generation()
             self._current_chat_id = str(uuid.uuid4())
+            self._current_chat_title = None
+            self._current_chat_has_ai_title = False
             self._messages = []
             self._last_prompt_eval_tokens = 0
             self._active_plan = None
@@ -387,6 +398,8 @@ class ChatPage(QWidget):
             return
 
         self._current_chat_id = chat_id
+        self._current_chat_title = data.get("title")
+        self._current_chat_has_ai_title = bool(data.get("ai_title", False))
         self._messages = data.get("messages", [])
         self._last_prompt_eval_tokens = 0
         self._clear_history_ui()
@@ -593,11 +606,50 @@ class ChatPage(QWidget):
         num_ctx = getattr(self, "_active_num_ctx", int(self._settings.get("num_ctx", 8192)))
         self._current_assistant_text = []
 
+        # Request AI summarization for conversation title if not yet established
+        if not self._current_chat_has_ai_title:
+            self._request_ai_chat_title(self._current_chat_id, text, model, url, num_ctx)
+
         est_tokens = estimate_messages_tokens(self._messages)
         if is_compaction_needed(est_tokens, num_ctx, threshold_ratio=0.75):
             self.top_bar.show_status(f"⚡ Checking tokens ({est_tokens:,}/{num_ctx:,}) — compacting history…", 30)
 
         mode = self.top_bar.current_mode()
+        extracted_urls = extract_urls(text)
+        if mode in ("auto", "chat") and extracted_urls:
+            if not self._settings.get("internet_access", False):
+                err = (
+                    "🌐 **Web access is disabled in Settings.**\n\n"
+                    "Enable **Internet Access** in Settings to allow fetching and analyzing web pages."
+                )
+                self._current_assistant_widget = ChatMessageWidget("assistant", err)
+                self.history_layout.insertWidget(
+                    self.history_layout.count() - 1, self._current_assistant_widget
+                )
+                self._current_assistant_widget.set_content(err, is_final=True)
+                self._messages.append({"role": "assistant", "content": err})
+                self._save_current_conversation()
+                self._cleanup_workers_state()
+                self._scroll_to_bottom(force=True)
+                return
+            else:
+                self._current_assistant_widget = ChatMessageWidget("assistant", "")
+                self.history_layout.insertWidget(
+                    self.history_layout.count() - 1, self._current_assistant_widget
+                )
+                opts = dict(self._settings)
+                opts["num_ctx"] = num_ctx
+                waw = self._active_chat_worker = WebAnswerWorker(
+                    url, model, text, extracted_urls, options=opts, parent=self
+                )
+                waw.status_message.connect(self.top_bar.show_status)
+                waw.token_received.connect(self._on_token_received)
+                waw.chat_finished.connect(self._on_chat_finished)
+                waw.chat_error.connect(self._on_worker_error)
+                waw.start()
+                self._scroll_to_bottom(force=True)
+                return
+
         if mode == "code":
             self._dispatch_task("code", text, url, model, num_ctx)
         elif mode == "chat":
@@ -666,7 +718,7 @@ class ChatPage(QWidget):
                 self.history_layout.count() - 1, self._current_assistant_widget
             )
         else:
-            self._current_assistant_widget.set_content(init_md, is_final=False)
+            self._current_assistant_widget.set_content(init_md, is_final=True)
 
         self._pending_research_topic = question
         self._pending_research_url = url
@@ -685,9 +737,11 @@ class ChatPage(QWidget):
         rw.plan_ready.connect(self._on_research_plan_ready)
         rw.progress.connect(self._on_research_progress_detailed)
         rw.status_message.connect(self._on_research_progress)
-        rw.finished.connect(self._on_research_finished)
+        rw.research_done.connect(self._on_research_finished)
         rw.error.connect(self._on_worker_error)
         rw.start()
+        self._last_research_progress_time = time.monotonic()
+        self._start_research_heartbeat()
         self._scroll_to_bottom(force=True)
 
     @Slot(object, str)
@@ -716,7 +770,7 @@ class ChatPage(QWidget):
                 f"🌐 *Web search and evidence collection in progress…*"
             )
             if self._current_assistant_widget:
-                self._current_assistant_widget.set_content(msg, is_final=False)
+                self._current_assistant_widget.set_content(msg, is_final=True)
             self._scroll_to_bottom()
         else:
             self.plan_stack.setCurrentWidget(self.research_plan_panel)
@@ -796,7 +850,7 @@ class ChatPage(QWidget):
                 self.history_layout.count() - 1, self._current_assistant_widget
             )
         else:
-            self._current_assistant_widget.set_content(start_md, is_final=False)
+            self._current_assistant_widget.set_content(start_md, is_final=True)
 
         rw = self._active_research_worker = ResearchWorker(
             url, model, topic=topic,
@@ -810,31 +864,62 @@ class ChatPage(QWidget):
         )
         rw.progress.connect(self._on_research_progress_detailed)
         rw.status_message.connect(self._on_research_progress)
-        rw.finished.connect(self._on_research_finished)
+        rw.research_done.connect(self._on_research_finished)
         rw.error.connect(self._on_worker_error)
         rw.start()
+        self._last_research_progress_time = time.monotonic()
+        self._start_research_heartbeat()
         self._scroll_to_bottom(force=True)
 
     @Slot(str, int, int, str, str)
     def _on_research_progress_detailed(self, phase: str, step: int, total: int, msg: str, eta: str) -> None:
         self.top_bar.notify_activity()
+        self._last_research_progress_time = time.monotonic()
         self.research_panel.update_active_step(phase, step, total, msg)
-        pct = int(step * 100 / max(total, 1))
+
+        # Compute ONE overall percentage across phases
+        total_sqs = total if total > 0 else 1
+        phase_lower = phase.lower()
+        if "plan" in phase_lower:
+            pct = int(step * 5 / max(total, 1))
+            stage_num = 1
+        elif "search" in phase_lower:
+            pct = 5 + int(step * 23 / total_sqs)
+            stage_num = 2
+        elif "read" in phase_lower:
+            pct = 28 + int(step * 23 / total_sqs)
+            stage_num = 3
+        elif "check" in phase_lower or "fact" in phase_lower:
+            pct = 51 + int(step * 24 / total_sqs)
+            stage_num = 4
+        elif "writ" in phase_lower:
+            pct = 75 + int(step * 25 / max(total, 1))
+            stage_num = 5
+        else:
+            pct = int(step * 100 / max(total, 1))
+            stage_num = 0
+        pct = max(0, min(100, pct))
+
         eta_suffix = f" • {eta}" if eta else ""
-        self.top_bar.show_status(f"🔬 {phase} [{step}/{total}]: {msg}{eta_suffix}", pct)
+        stage_prefix = f"Stage {stage_num} of 5 - {phase}" if stage_num else phase
+        self.top_bar.show_status(f"🔬 {stage_prefix} [{step}/{total}]: {msg}{eta_suffix}", pct)
 
         if not hasattr(self, "_research_activity_log") or self._research_activity_log is None:
             self._research_activity_log = []
 
-        if msg and (not self._research_activity_log or self._research_activity_log[-1] != msg):
-            self._research_activity_log.append(msg)
+        if msg:
+            is_dup = any(msg in entry for entry in self._research_activity_log[-30:])
+            if not is_dup:
+                import datetime as _dt
+                ts = _dt.datetime.now().strftime("%H:%M:%S")
+                self._research_activity_log.append(f"[{ts}] {msg}")
 
         depth = self.top_bar.research_depth().capitalize()
         recent_logs = self._research_activity_log[-8:]
         log_lines = "\n".join(f"- {line}" for line in recent_logs)
 
         card_md = (
-            f"### 🔬 Deep Research: {phase} [{step}/{total}]\n\n"
+            f"### 🔬 Deep Research: {stage_prefix} [{step}/{total}]\n\n"
             f"- **🌐 Web Access:** `ACTIVE` (DuckDuckGo Live Search & Content Extraction)\n"
             f"- **⚡ Depth:** {depth}\n"
             f"- **⏱️ Progress:** Step {step} of {total}{eta_suffix}\n"
@@ -843,22 +928,71 @@ class ChatPage(QWidget):
             f"{log_lines}"
         )
         if self._current_assistant_widget:
-            self._current_assistant_widget.set_content(card_md, is_final=False)
+            self._current_assistant_widget.set_content(card_md, is_final=True)
             self._scroll_to_bottom()
 
     @Slot(str)
     def _on_research_progress(self, msg: str) -> None:
         self.top_bar.notify_activity()
-        self.top_bar.show_status(msg)
+        # Don't overwrite progress bar with indeterminate status if detailed progress arrived recently
+        now = time.monotonic()
+        last = getattr(self, "_last_research_progress_time", 0)
+        if now - last < 2.0:
+            pass  # skip show_status to preserve percentage in top bar
+        else:
+            self.top_bar.show_status(msg)
         if hasattr(self, "_research_activity_log") and self._research_activity_log is not None:
-            if msg and (not self._research_activity_log or self._research_activity_log[-1] != msg):
-                self._research_activity_log.append(msg)
+            if msg:
+                is_dup = any(msg in entry for entry in self._research_activity_log[-30:])
+                if not is_dup:
+                    import datetime as _dt
+                    ts = _dt.datetime.now().strftime("%H:%M:%S")
+                    self._research_activity_log.append(f"[{ts}] {msg}")
+
+    # ── Research Heartbeat Timer ───────────────────────────────────────
+
+    def _start_research_heartbeat(self) -> None:
+        """Start a 1-second heartbeat timer showing elapsed time during research."""
+        self._research_start_mono = time.monotonic()
+        if not hasattr(self, "_research_heartbeat_timer"):
+            self._research_heartbeat_timer = QTimer(self)
+            self._research_heartbeat_timer.setInterval(1000)
+            self._research_heartbeat_timer.timeout.connect(self._on_heartbeat_tick)
+        if not self._research_heartbeat_timer.isActive():
+            self._research_heartbeat_timer.start()
+
+    def _stop_research_heartbeat(self) -> None:
+        """Stop the research heartbeat timer."""
+        if hasattr(self, "_research_heartbeat_timer") and self._research_heartbeat_timer.isActive():
+            self._research_heartbeat_timer.stop()
+
+    def _on_heartbeat_tick(self) -> None:
+        """Update elapsed time in status bar; show 'still working' if stale."""
+        if not self._active_research_worker:
+            self._stop_research_heartbeat()
+            return
+        elapsed = time.monotonic() - getattr(self, "_research_start_mono", time.monotonic())
+        mm = int(elapsed) // 60
+        ss = int(elapsed) % 60
+        elapsed_str = f"{mm:02d}:{ss:02d}"
+
+        last_prog = getattr(self, "_last_research_progress_time", 0)
+        stale = (time.monotonic() - last_prog) > 5.0 if last_prog else False
+
+        current_status = self.top_bar.lbl_status.text()
+        # Only append elapsed / stale suffix, don't replace progress text
+        base = current_status.split(" [elapsed")[0].split(" — model")[0]
+        suffix = f" [elapsed {elapsed_str}]"
+        if stale:
+            suffix += " — model is still working…"
+        self.top_bar.lbl_status.setText(base + suffix)
 
     @Slot(str)
     def _on_research_finished(self, project_id: str) -> None:
         """Finalise the research project and present report button in chat."""
         self._stream_flush_timer.stop()
         self._pending_stream_dirty = False
+        self._stop_research_heartbeat()
         self.top_bar.set_idle()
         self.research_panel.refresh()
 
@@ -899,7 +1033,7 @@ class ChatPage(QWidget):
         """Resume an interrupted research project from the Research Library."""
         url = self._settings.get("ollama_url", "http://localhost:11434")
         model = self.top_bar.current_model()
-        num_ctx = resolve_num_ctx(self._settings.get("num_ctx", 8192), model)
+        num_ctx = getattr(self, "_active_num_ctx", int(self._settings.get("num_ctx", 8192)))
         self.tabs.setCurrentIndex(0)
         self.top_bar.show_status("🔬 Resuming research from checkpoint…")
 
@@ -920,7 +1054,7 @@ class ChatPage(QWidget):
                 self.history_layout.count() - 1, self._current_assistant_widget
             )
         else:
-            self._current_assistant_widget.set_content(resume_md, is_final=False)
+            self._current_assistant_widget.set_content(resume_md, is_final=True)
 
         rw = self._active_research_worker = ResearchWorker(
             url, model, project_id=project_id,
@@ -931,9 +1065,11 @@ class ChatPage(QWidget):
         )
         rw.progress.connect(self._on_research_progress_detailed)
         rw.status_message.connect(self._on_research_progress)
-        rw.finished.connect(self._on_research_finished)
+        rw.research_done.connect(self._on_research_finished)
         rw.error.connect(self._on_worker_error)
         rw.start()
+        self._last_research_progress_time = time.monotonic()
+        self._start_research_heartbeat()
         self._scroll_to_bottom(force=True)
 
     def _on_classify_done(self, task_type: str, text: str, url: str, model: str, num_ctx: int) -> None:
@@ -1309,6 +1445,7 @@ class ChatPage(QWidget):
 
     @Slot(str)
     def _on_worker_error(self, err_msg: str) -> None:
+        self._stop_research_heartbeat()
         self.top_bar.set_idle()
         if self._current_assistant_widget:
             self._current_assistant_widget.set_content(f"⚠️ {err_msg}")
@@ -1318,6 +1455,7 @@ class ChatPage(QWidget):
 
     def _stop_chat_generation(self) -> None:
         """Stop chat and planning workers without interrupting background code builds."""
+        self._stop_research_heartbeat()
         if hasattr(self, "_stream_flush_timer") and self._stream_flush_timer.isActive():
             self._stream_flush_timer.stop()
             self._flush_stream_ui()
@@ -1327,6 +1465,10 @@ class ChatPage(QWidget):
                 if hasattr(w, "stop"):
                     w.stop()
                 w.wait(400)
+        for tw in list(self._active_title_workers):
+            if tw.isRunning():
+                tw.wait(200)
+        self._active_title_workers.clear()
         self._active_chat_worker = None
         self._active_plan_worker = None
         self._classify_worker = None
@@ -1372,13 +1514,14 @@ class ChatPage(QWidget):
         if not self._messages:
             return
 
-        title = next(
+        title = self._current_chat_title or next(
             (m["content"][:30] + ("…" if len(m["content"]) > 30 else "") for m in self._messages if m["role"] == "user"),
             "New Chat",
         )
         chat_data: dict[str, Any] = {
             "id": self._current_chat_id,
             "title": title,
+            "ai_title": self._current_chat_has_ai_title,
             "messages": self._messages,
             "artifacts": dict(self._build_files),
         }
@@ -1395,6 +1538,37 @@ class ChatPage(QWidget):
             }
         save_chat(chat_data)
         self.sidebar.upsert_chat(self._current_chat_id, title)
+
+    def _request_ai_chat_title(self, chat_id: str, prompt: str, model: str, url: str, num_ctx: int) -> None:
+        """Spawn background TitleWorker to summarize conversation topic."""
+        title_model = self._settings.get("summarizer_model") or model
+        if not title_model or not url:
+            return
+        tw = TitleWorker(chat_id, url, title_model, prompt, num_ctx=min(num_ctx, 4096), parent=self)
+        tw.title_ready.connect(self._on_ai_title_ready)
+        tw.finished.connect(lambda: self._active_title_workers.remove(tw) if tw in self._active_title_workers else None)
+        tw.finished.connect(tw.deleteLater)
+        self._active_title_workers.append(tw)
+        tw.start()
+
+    @Slot(str, str)
+    def _on_ai_title_ready(self, chat_id: str, title: str) -> None:
+        """Apply AI-generated conversation title to sidebar, memory, and disk."""
+        if not title:
+            return
+        # 1. Update sidebar item
+        self.sidebar.upsert_chat(chat_id, title)
+
+        # 2. Update memory if current chat
+        if self._current_chat_id == chat_id:
+            self._current_chat_title = title
+            self._current_chat_has_ai_title = True
+
+        # 3. Update saved file on disk
+        if c_data := load_chat(chat_id):
+            c_data["title"] = title
+            c_data["ai_title"] = True
+            save_chat(c_data)
 
     def _on_scroll_value_changed(self, value: int) -> None:
         """Track if the user has manually scrolled up to read earlier text."""

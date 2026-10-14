@@ -49,6 +49,8 @@ from core.web_research import (
     fetch_pages,
     extract_text,
     chunk_and_rank,
+    extract_urls,
+    normalize_url,
 )
 
 
@@ -429,10 +431,11 @@ def extract_evidence_from_source(
     source: dict,
     num_ctx: int = 8192,
     stop_flag: Callable[[], bool] | None = None,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> list[dict]:
     """
     Feed source text chunks under the token budget to the model.
-    Returns list of parsed claims: [{claim, exact_quote, context}].
+    Returns list of parsed claims (at most 3): [{claim, exact_quote, context}].
     """
     url = source.get("url", "")
     text = source.get("text", "")
@@ -447,7 +450,7 @@ def extract_evidence_from_source(
         f"## Research Sub-Question\n{question}\n\n"
         f"## Source URL\n{url}\n\n"
         f"## Page Text (Untrusted Data)\n```\n{trimmed_text}\n```\n\n"
-        "Extract relevant claims with exact quotes. Return ONLY JSON matching {\"claims\": [...]}."
+        "Extract at most 3 relevant claims with exact quotes. Return ONLY JSON matching {\"claims\": [...]}. Limit to at most 3 claims."
     )
 
     messages = [
@@ -477,7 +480,9 @@ def extract_evidence_from_source(
                 chunks.append(content)
             if chunk.get("done"):
                 break
-    except Exception:
+    except Exception as exc:
+        if progress_cb:
+            progress_cb(f"⚠️ Model call failed for {source.get('domain', url)}: {exc}")
         return []
 
     full_output = "".join(chunks).strip()
@@ -485,7 +490,7 @@ def extract_evidence_from_source(
         data = json.loads(full_output)
         claims = data.get("claims", [])
         if isinstance(claims, list):
-            return claims
+            return claims[:3]
     except Exception:
         # Fallback regex search for json block
         m = re.search(r"\{.*\}", full_output, re.DOTALL)
@@ -494,9 +499,15 @@ def extract_evidence_from_source(
                 data = json.loads(m.group(0))
                 claims = data.get("claims", [])
                 if isinstance(claims, list):
-                    return claims
+                    return claims[:3]
             except Exception:
                 pass
+        # Surface truncated or invalid JSON
+        import logging
+        logging.warning("Invalid/truncated JSON from model for %s: %s", source.get("domain", url), full_output[:120])
+        if progress_cb:
+            domain = source.get("domain") or urlparse(url).netloc
+            progress_cb(f"⚠️ Model returned invalid or truncated JSON when analyzing {domain}")
     return []
 
 
@@ -595,6 +606,7 @@ class ResearchEngine:
         progress_cb: Callable[[str, int, int, str], None] | None = None,
         stop_flag: Callable[[], bool] | None = None,
         client: OllamaClient | None = None,
+        topic: str = "",
     ) -> None:
         self.project_id = project_id
         self.plan = plan
@@ -609,6 +621,7 @@ class ResearchEngine:
         if self.client is None:
             self.client = OllamaClient(ollama_url)
             self._own_client = True
+        self.topic = topic or (getattr(self.plan, "topic", "") if self.plan else "") or (getattr(self.plan, "main_question", "") if self.plan else "")
 
         # Depth limits
         if self.depth == "quick":
@@ -645,23 +658,127 @@ class ResearchEngine:
             return
 
         self._notify("Searching", sq_idx, total_sqs, f"🌐 Web Search: Starting SQ {sq.index}: {sq.question[:45]}…")
+        new_source_notes: list[dict] = []
 
-        # a) Gather queries: initial plan queries + mandatory counter query
+        # Direct URL support: if topic contains a URL, fetch directly first on SQ 1
+        topic_urls = extract_urls(self.topic) if self.topic else []
+        is_single_site = bool(
+            topic_urls
+            and (
+                len(topic_urls) == 1
+                and (
+                    len(self.topic.split()) <= 4
+                    or topic_urls[0] in self.topic
+                    or self.topic.strip().startswith("http")
+                )
+            )
+        )
+
+        if sq_idx == 1 and topic_urls:
+            for seed_url in topic_urls:
+                if self._is_stopped():
+                    return
+                if not any(s.get("url") == seed_url for s in self.sources):
+                    self._notify("Searching", sq_idx, total_sqs, f"🌐 Direct Seed URL: Fetching {seed_url}…")
+                    seed_fetched = fetch_pages([seed_url])
+                    self.total_pages_fetched += len(seed_fetched)
+                    for s_page in seed_fetched:
+                        if s_page.get("error"):
+                            self._notify(
+                                "Searching",
+                                sq_idx,
+                                total_sqs,
+                                f"⚠️ Could not fetch seeded URL {seed_url}: {s_page.get('error')}",
+                            )
+                            continue
+                        s_html = s_page.get("html", "")
+                        s_text = extract_text(s_html, url=seed_url)
+                        if not s_text or len(s_text.strip()) < 100:
+                            continue
+                        s_cred, s_reason = credibility_score(seed_url, s_text)
+                        s_id = len(self.sources) + 1
+                        s_domain = extract_registered_domain(seed_url) or urlparse(seed_url).netloc
+                        s_entry = {
+                            "id": s_id,
+                            "url": seed_url,
+                            "domain": s_domain,
+                            "text": s_text,
+                            "credibility": s_cred,
+                            "credibility_reason": s_reason,
+                            "title": urlparse(seed_url).netloc,
+                        }
+                        self.sources.append(s_entry)
+                        self.sources_map[s_id] = s_entry
+
+                        self._notify("Checking facts", sq_idx, total_sqs, f"🔍 Extracting claims from {s_domain}")
+                        s_claims = extract_evidence_from_source(
+                            client=self.client,
+                            model=self.model,
+                            question=sq.question,
+                            source=s_entry,
+                            num_ctx=self.num_ctx,
+                            stop_flag=self.stop_flag,
+                            progress_cb=lambda msg: self._notify("Checking facts", sq_idx, total_sqs, msg),
+                        )
+                        s_verified = []
+                        s_dropped = 0
+                        for c in s_claims:
+                            if verify_quote(c.get("exact_quote", ""), s_text):
+                                c["source_id"] = s_id
+                                c["url"] = seed_url
+                                s_verified.append(c)
+                            else:
+                                self.dropped_quotes_count += 1
+                                s_dropped += 1
+                        self._notify(
+                            "Checking facts",
+                            sq_idx,
+                            total_sqs,
+                            f"🛡️ Kept {len(s_verified)} claims, dropped {s_dropped} unverifiable quotes from {s_domain}",
+                        )
+                        if s_verified:
+                            new_source_notes.append({
+                                "source_id": s_id,
+                                "url": seed_url,
+                                "sub_question_index": sq.index,
+                                "claims": s_verified,
+                            })
+                            self.ledger = group_and_update_ledger(
+                                self.ledger,
+                                s_verified,
+                                self.sources_map,
+                                sq.index,
+                            )
+
+        # a) Gather queries: initial plan queries + mandatory counter query (skip if single-site)
         queries = list(sq.search_queries[:2])
-        counter_query = f"criticism of {sq.question[:40]} problems debunked"
-        queries.append(counter_query)
+        if not is_single_site:
+            counter_query = f"criticism of {sq.question[:40]} problems debunked"
+            queries.append(counter_query)
 
-        # Collect URLs from search
+        # Collect URLs from search with 1s pause between queries to avoid DDG rate limits
         urls_to_fetch: list[str] = []
-        for q in queries:
+        for i, q in enumerate(queries):
             if self._is_stopped():
                 return
+            if i > 0:
+                time.sleep(1.0)
             self._notify("Searching", sq_idx, total_sqs, f"🌐 Web Search: DuckDuckGo query '{q[:40]}…'")
             results = search(q, max_results=4)
-            for r in results:
-                url = r.get("url", "")
-                if url and url not in urls_to_fetch:
-                    urls_to_fetch.append(url)
+            if results and (results[0].get("url") == "" or "error" in results[0]):
+                err_msg = results[0].get("error") or results[0].get("snippet") or "Search failed"
+                self._notify("Searching", sq_idx, total_sqs, f"⚠️ Search failed: {err_msg}")
+            else:
+                self._notify(
+                    "Searching",
+                    sq_idx,
+                    total_sqs,
+                    f"🌐 Web Search: Query '{q[:35]}…' returned {len(results)} results",
+                )
+                for r in results:
+                    url = r.get("url", "")
+                    if url and url not in urls_to_fetch:
+                        urls_to_fetch.append(url)
 
         # Limit pages per SQ
         urls_to_fetch = urls_to_fetch[: self.max_pages_per_sq]
@@ -672,17 +789,36 @@ class ResearchEngine:
         fetched = fetch_pages(urls_to_fetch)
         self.total_pages_fetched += len(fetched)
 
-        # Process each page
-        new_source_notes: list[dict] = []
-        for page in fetched:
+        # Surface fetch errors
+        for p in fetched:
+            if p.get("error"):
+                domain_err = extract_registered_domain(p.get("url", "")) or urlparse(p.get("url", "")).netloc
+                self._notify("Reading", sq_idx, total_sqs, f"⚠️ Could not fetch {domain_err}: {p.get('error')}")
+
+        # Process each page with granular progress
+        valid_pages = [p for p in fetched if p.get("html")]
+        total_valid = len(valid_pages)
+
+        for page_idx, page in enumerate(valid_pages, start=1):
             if self._is_stopped():
                 return
 
             url = page.get("url", "")
             raw_html = page.get("html", "")
-            text = extract_text(raw_html)
+            domain = extract_registered_domain(url) or urlparse(url).netloc
+            self._notify("Reading", sq_idx, total_sqs, f"📄 Reading page {page_idx} of {total_valid}: {domain}")
+
+            text = extract_text(raw_html, url=url)
             if not text or len(text.strip()) < 100:
                 continue
+
+            if "[Note: This website renders content dynamically with JavaScript" in text:
+                self._notify(
+                    "Reading",
+                    sq_idx,
+                    total_sqs,
+                    f"ℹ️ Site renders with JavaScript — limited static info extracted from {domain}",
+                )
 
             # Check near-duplicates against existing sources
             duplicate = False
@@ -700,7 +836,7 @@ class ResearchEngine:
             source_entry = {
                 "id": source_id,
                 "url": url,
-                "domain": extract_registered_domain(url),
+                "domain": domain,
                 "text": text,
                 "credibility": cred,
                 "credibility_reason": reason,
@@ -710,7 +846,7 @@ class ResearchEngine:
             self.sources_map[source_id] = source_entry
 
             # b) Extract claims with exact quotes (one model call at a time)
-            self._notify("Checking facts", sq_idx, total_sqs, f"🛡️ Fact Check: Verifying quotes from {source_entry['domain']} (Credibility: {cred:.2f})")
+            self._notify("Checking facts", sq_idx, total_sqs, f"🔍 Extracting claims from {domain}")
             raw_claims = extract_evidence_from_source(
                 client=self.client,
                 model=self.model,
@@ -718,10 +854,12 @@ class ResearchEngine:
                 source=source_entry,
                 num_ctx=self.num_ctx,
                 stop_flag=self.stop_flag,
+                progress_cb=lambda msg: self._notify("Checking facts", sq_idx, total_sqs, msg),
             )
 
             # c) Quote verification in plain Python
             verified_claims: list[dict] = []
+            dropped_this_page = 0
             for c in raw_claims:
                 quote = c.get("exact_quote", "")
                 if verify_quote(quote, text):
@@ -730,6 +868,14 @@ class ResearchEngine:
                     verified_claims.append(c)
                 else:
                     self.dropped_quotes_count += 1
+                    dropped_this_page += 1
+
+            self._notify(
+                "Checking facts",
+                sq_idx,
+                total_sqs,
+                f"🛡️ Kept {len(verified_claims)} claims, dropped {dropped_this_page} unverifiable quotes from {domain}",
+            )
 
             if verified_claims:
                 new_source_notes.append({

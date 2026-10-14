@@ -48,7 +48,7 @@ class ResearchWorker(QThread):
     progress = Signal(str, int, int, str, str)  # phase, step, total, msg, eta
     status_message = Signal(str)
     section_written = Signal(str, str)
-    finished = Signal(str)
+    research_done = Signal(str)
     error = Signal(str)
 
     def __init__(
@@ -99,7 +99,6 @@ class ResearchWorker(QThread):
     def _on_engine_progress(self, phase: str, step: int, total: int, msg: str) -> None:
         eta = self._format_eta(step, total)
         self.progress.emit(phase, step, total, msg, eta)
-        self.status_message.emit(f"[{phase}] {msg}")
 
     def run(self) -> None:
         self._start_time = time.time()
@@ -172,10 +171,19 @@ class ResearchWorker(QThread):
             progress_cb=self._on_engine_progress,
             stop_flag=self._is_stopped,
             client=client,
+            topic=self.topic,
         )
         engine.run_all()
 
         if self._is_stopped():
+            return
+
+        # Evidence guard: refuse to write report from nothing
+        if not engine.sources or not engine.ledger:
+            self.error.emit(
+                "Research could not gather any evidence.\n"
+                "Possible reasons: search failed, pages blocked, or no verifiable claims found."
+            )
             return
 
         # 2. Run Report Writer
@@ -213,6 +221,7 @@ class ResearchWorker(QThread):
                 progress_cb=self._on_engine_progress,
                 stop_flag=self._is_stopped,
                 client=client,
+                topic=self.topic,
             )
             # Rehydrate engine state
             engine.sources = sources
@@ -223,6 +232,13 @@ class ResearchWorker(QThread):
 
             engine.run_all(resume_from_sq=sq_idx + 1)
             if not self._is_stopped():
+                # Evidence guard: refuse to write report from nothing
+                if not engine.sources or not engine.ledger:
+                    self.error.emit(
+                        "Research could not gather any evidence after resuming.\n"
+                        "Possible reasons: search failed, pages blocked, or no verifiable claims found."
+                    )
+                    return
                 self._run_writer(client, engine.sources, engine.ledger, engine.dropped_quotes_count)
 
     def _run_writer(
@@ -251,7 +267,7 @@ class ResearchWorker(QThread):
 
         if not self._is_stopped():
             self.status_message.emit("Research report completed.")
-            self.finished.emit(self.project_id)
+            self.research_done.emit(self.project_id)
 
     def _run_auto(self, client: OllamaClient) -> None:
         """Run end-to-end when auto-approve is active."""

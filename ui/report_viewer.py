@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +46,11 @@ except Exception:
 
 def _get_mermaid_js_url() -> str:
     """Return local file:// URL for bundled assets/mermaid.min.js."""
-    base_dir = Path(__file__).resolve().parent.parent
+    base_dir = (
+        Path(sys._MEIPASS)
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
+        else Path(__file__).resolve().parent.parent
+    )
     js_path = base_dir / "assets" / "mermaid.min.js"
     return js_path.as_uri()
 
@@ -294,7 +299,11 @@ class ReportViewerDialog(QDialog):
                 page.settings().setAttribute(page.settings().WebAttribute.JavascriptEnabled, True)
                 self._web_view.setPage(page)
 
-                base_dir = Path(__file__).resolve().parent.parent / "assets"
+                base_dir = (
+                    Path(sys._MEIPASS)
+                    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
+                    else Path(__file__).resolve().parent.parent
+                ) / "assets"
                 base_url = QUrl.fromLocalFile(str(base_dir) + os.sep)
                 self._web_view.setHtml(html_doc, baseUrl=base_url)
                 layout.addWidget(self._web_view)

@@ -92,7 +92,7 @@ class ChatTopBar(QWidget):
         # 🌐 Web badge — shown when internet access is enabled
         self.lbl_web_badge = QLabel("🌐 Web")
         self.lbl_web_badge.setToolTip(
-            "Internet access is enabled. Web Research mode is available.\n"
+            "Internet access is enabled. Web access works for Research mode and for prompts containing a URL.\n"
             "Disable in Settings > Internet Access to go fully offline."
         )
         self.lbl_web_badge.setStyleSheet(
