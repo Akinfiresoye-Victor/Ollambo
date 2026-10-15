@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import datetime
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.storage import delete_chat, delete_work_session, list_chats, list_active_sessions
+from core.storage import delete_chat, delete_work_session, list_chats
 from ui.icons import Spinner, icon
 from ui.theme import set_variant
 from ui.theme.tokens import DARK
@@ -69,6 +69,7 @@ class _ChatRow(QWidget):
         self.more_button.setToolTip("Chat actions")
         self.more_button.setProperty("variant", "ghost")
         self.more_button.setProperty("iconOnly", "true")
+        self.more_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.more_button.setFixedSize(28, 28)
         self.more_button.clicked.connect(self.more_clicked.emit)
         self.more_button.hide()
@@ -108,6 +109,13 @@ class _ChatRow(QWidget):
         editor.editingFinished.connect(self._finish_rename)
         editor.setFocus()
 
+    def set_title(self, title: str) -> None:
+        self._title = title
+        display_title, _ = strip_emoji_prefix(title)
+        self.title_label.setText(QFontMetrics(self.title_label.font()).elidedText(
+            display_title, Qt.TextElideMode.ElideRight, max(0, self.title_label.width() - 4)
+        ))
+
     def _finish_rename(self) -> None:
         editor = self._title_editor
         if editor is None:
@@ -140,11 +148,14 @@ class ChatSidebar(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setObjectName("Sidebar")
         self.setMinimumWidth(0)
         self.setMaximumWidth(DARK.sizes.sidebar_width)
         self._wip_chat_id: str | None = None
         self._low_power_mode = False
+        self._active_chat_id: str | None = None
+        self._runtime_statuses: dict[str, str] = {}
         self._build_ui()
         self.refresh_list()
 
@@ -162,6 +173,7 @@ class ChatSidebar(QWidget):
         self.btn_collapse.setToolTip("Collapse sidebar (Ctrl+B)")
         self.btn_collapse.setProperty("variant", "ghost")
         self.btn_collapse.setProperty("iconOnly", "true")
+        self.btn_collapse.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_collapse.clicked.connect(self.toggle_requested.emit)
         brand_row.addWidget(self.btn_collapse)
         pix = get_app_pixmap(26)
@@ -176,13 +188,15 @@ class ChatSidebar(QWidget):
         layout.addLayout(brand_row)
 
         self.btn_new = QPushButton("New chat")
-        self.btn_new.setIcon(icon("plus"))
+        self.btn_new.setIcon(icon("plus", DARK.colors.text_on_accent, 18))
+        self.btn_new.setStyleSheet("padding-left: 12px;")
         set_variant(self.btn_new, "primary")
         self.btn_new.clicked.connect(self.new_chat_clicked.emit)
         layout.addWidget(self.btn_new)
 
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search chats")
+        self.search_input.setTextMargins(32, 0, 0, 0)
         self.search_input.addAction(icon("search"), QLineEdit.ActionPosition.LeadingPosition)
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setToolTip("Search chat titles (Ctrl+K)")
@@ -190,15 +204,18 @@ class ChatSidebar(QWidget):
         layout.addWidget(self.search_input)
 
         self.list_widget = QListWidget()
-        layout.addWidget(self.list_widget)
-
-        layout.addStretch()
+        self.list_widget.setProperty("role", "body")
+        self.list_widget.setStyleSheet("QListWidget { background: transparent; border: none; }")
+        layout.addWidget(self.list_widget, 1)
         self.btn_library = QPushButton("Library")
         self.btn_library.setIcon(icon("flask"))
+        self.btn_library.setToolTip("Research Library and Artifacts")
+        self.btn_library.setStyleSheet("padding-left: 12px;")
         self.btn_library.clicked.connect(self.library_clicked.emit)
         layout.addWidget(self.btn_library)
         self.btn_cfg = QPushButton("Settings")
         self.btn_cfg.setIcon(icon("settings"))
+        self.btn_cfg.setStyleSheet("padding-left: 12px;")
         self.btn_cfg.setToolTip("Settings (Ctrl+,)")
         self.btn_cfg.clicked.connect(self.settings_clicked.emit)
         layout.addWidget(self.btn_cfg)
@@ -218,16 +235,32 @@ class ChatSidebar(QWidget):
     # ── Chat list ─────────────────────────────────────────────────────
 
     def refresh_list(self) -> None:
-        """Reload saved chat records from disk."""
-        selected = self.list_widget.currentItem()
-        selected_id = selected.data(Qt.ItemDataRole.UserRole) if selected else None
-        active_ids = set(list_active_sessions())
-        if self._wip_chat_id:
-            active_ids.add(self._wip_chat_id)
+        """Reload saved chat records from disk without reordering the list on simple selection updates."""
+        previous_order = [
+            self.list_widget.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.list_widget.count())
+            if self.list_widget.item(i).data(Qt.ItemDataRole.UserRole) is not None
+        ]
+        chats = list_chats()
+        chat_map = {c["id"]: c for c in chats}
+        ordered_ids = [chat_id for chat_id in previous_order if chat_id in chat_map]
+        remaining = [c for c in chats if c["id"] not in set(ordered_ids)]
+        ordered_chats = [chat_map[chat_id] for chat_id in ordered_ids] + remaining
+
         self.list_widget.clear()
         current_group = None
-        for c in list_chats():
-            status = "building" if c["id"] in active_ids else c.get("status", "idle")
+        for c in ordered_chats:
+            if c["id"] in self._runtime_statuses:
+                status = self._runtime_statuses[c["id"]]
+            else:
+                status = c.get("status", "idle")
+            if (
+                c["id"] not in self._runtime_statuses
+                and status in ("generating", "planning", "researching", "building")
+            ):
+                status = "idle"
+            if c["id"] == self._wip_chat_id:
+                status = "building"
             group = self._date_group(c.get("updated", 0))
             if group != current_group:
                 header = QListWidgetItem(group)
@@ -236,14 +269,15 @@ class ChatSidebar(QWidget):
                 current_group = group
             title = c["title"]
             display_title, _ = strip_emoji_prefix(title)
-            item = QListWidgetItem(display_title)
+            item = QListWidgetItem("")
             item.setData(Qt.ItemDataRole.UserRole, c["id"])
             item.setData(Qt.ItemDataRole.UserRole + 1, status)
             item.setData(Qt.ItemDataRole.UserRole + 2, bool(c.get("unread", False)))
             item.setData(Qt.ItemDataRole.UserRole + 3, c["title"])
+            item.setData(Qt.ItemDataRole.UserRole + 4, c.get("updated", 0))
             self.list_widget.addItem(item)
             row = self._set_row(item, title, status, bool(c.get("unread", False)))
-            if c["id"] == selected_id:
+            if c["id"] == self._active_chat_id:
                 self.list_widget.setCurrentItem(item)
             if status in ("generating", "planning", "researching", "building"):
                 tooltip = "Work in progress. Click to return to this chat."
@@ -254,6 +288,9 @@ class ChatSidebar(QWidget):
             item.setToolTip(tooltip)
             row.setToolTip(tooltip)
         self._apply_filter(self.search_input.text())
+        if self._active_chat_id is None:
+            self.list_widget.setCurrentRow(-1)
+            self.list_widget.clearSelection()
 
     def _set_row(
         self,
@@ -270,7 +307,7 @@ class ChatSidebar(QWidget):
             self._low_power_mode,
         )
         self.list_widget.setItemWidget(item, row)
-        item.setSizeHint(row.sizeHint())
+        item.setSizeHint(QSize(row.sizeHint().width(), max(row.sizeHint().height(), 36)))
         row.more_clicked.connect(lambda cid=chat_id, chat_item=item: self._show_chat_menu(cid, chat_item))
         row.selected.connect(lambda cid=chat_id, chat_item=item: self._select_chat(cid, chat_item))
         row.renamed.connect(
@@ -301,17 +338,157 @@ class ChatSidebar(QWidget):
         title: str,
         status: str | None = None,
         unread: bool | None = None,
+        new_message: bool = False,
     ) -> None:
-        """Refresh date groups after storage moves a chat to the top."""
-        self.refresh_list()
+        """Update one row, moving it only when a new transcript message arrives."""
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             if item.data(Qt.ItemDataRole.UserRole) != chat_id:
                 continue
             item.setData(Qt.ItemDataRole.UserRole + 3, title)
-            item.setText(strip_emoji_prefix(title)[0])
+            row = self.list_widget.itemWidget(item)
+            if isinstance(row, _ChatRow) and row._title != title:
+                row.set_title(title)
             self.set_chat_state(chat_id, status=status, unread=unread)
+            if new_message:
+                chat = next((c for c in list_chats() if c["id"] == chat_id), None)
+                if chat is not None:
+                    item.setData(Qt.ItemDataRole.UserRole + 4, chat.get("updated", 0))
+                    self._move_chat_to_group_top(item, self._date_group(chat.get("updated", 0)))
             break
+        else:
+            chat = next((c for c in list_chats() if c["id"] == chat_id), None)
+            if chat is not None:
+                if status is not None:
+                    self._runtime_statuses[chat_id] = status
+                row_status = self._runtime_statuses.get(chat_id, chat.get("status", "idle"))
+                if (
+                    chat_id not in self._runtime_statuses
+                    and row_status in ("generating", "planning", "researching", "building")
+                ):
+                    row_status = "idle"
+                if chat_id == self._wip_chat_id:
+                    row_status = "building"
+                row_unread = bool(chat.get("unread", False)) if unread is None else unread
+                self._insert_chat_row(chat, row_status, row_unread, prepend=new_message)
+
+    def _insert_chat_row(
+        self,
+        chat: dict,
+        status: str,
+        unread: bool,
+        *,
+        prepend: bool,
+    ) -> None:
+        chat_id = chat["id"]
+        group = self._date_group(chat.get("updated", 0))
+        header_row = next(
+            (
+                index
+                for index in range(self.list_widget.count())
+                if self.list_widget.item(index).data(Qt.ItemDataRole.UserRole) is None
+                and self.list_widget.item(index).text() == group
+            ),
+            None,
+        )
+        group_order = ("Today", "Yesterday", "Previous 7 days", "Older")
+        if header_row is None:
+            insert_at = self.list_widget.count()
+            for index in range(self.list_widget.count()):
+                item = self.list_widget.item(index)
+                if (
+                    item.data(Qt.ItemDataRole.UserRole) is None
+                    and group_order.index(item.text()) > group_order.index(group)
+                ):
+                    insert_at = index
+                    break
+            header = QListWidgetItem(group)
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.list_widget.insertItem(insert_at, header)
+            header_row = insert_at
+
+        insert_at = header_row + 1
+        if not prepend:
+            while (
+                insert_at < self.list_widget.count()
+                and self.list_widget.item(insert_at).data(Qt.ItemDataRole.UserRole) is not None
+            ):
+                insert_at += 1
+        item = QListWidgetItem("")
+        item.setData(Qt.ItemDataRole.UserRole, chat_id)
+        item.setData(Qt.ItemDataRole.UserRole + 1, status)
+        item.setData(Qt.ItemDataRole.UserRole + 2, unread)
+        item.setData(Qt.ItemDataRole.UserRole + 3, chat["title"])
+        item.setData(Qt.ItemDataRole.UserRole + 4, chat.get("updated", 0))
+        self.list_widget.insertItem(insert_at, item)
+        row = self._set_row(item, chat["title"], status, unread)
+        if chat_id == self._active_chat_id:
+            self.list_widget.setCurrentItem(item)
+        if status in ("generating", "planning", "researching", "building"):
+            tooltip = "Work in progress. Click to return to this chat."
+        elif unread:
+            tooltip = "New activity"
+        else:
+            tooltip = ""
+        item.setToolTip(tooltip)
+        row.setToolTip(tooltip)
+        self._apply_filter(self.search_input.text())
+
+    def _move_chat_to_group_top(self, item: QListWidgetItem, group: str) -> None:
+        old_row = self.list_widget.row(item)
+        row_widget = self.list_widget.itemWidget(item)
+        self.list_widget.removeItemWidget(item)
+        self.list_widget.takeItem(old_row)
+
+        old_header = None
+        for index in range(old_row - 1, -1, -1):
+            candidate = self.list_widget.item(index)
+            if candidate.data(Qt.ItemDataRole.UserRole) is None:
+                old_header = candidate
+                break
+        if old_header is not None:
+            header_row = self.list_widget.row(old_header)
+            next_header = next(
+                (
+                    self.list_widget.item(index)
+                    for index in range(header_row + 1, self.list_widget.count())
+                    if self.list_widget.item(index).data(Qt.ItemDataRole.UserRole) is None
+                ),
+                None,
+            )
+            if next_header is None:
+                has_chat = header_row + 1 < self.list_widget.count()
+            else:
+                has_chat = self.list_widget.row(next_header) > header_row + 1
+            if not has_chat:
+                self.list_widget.takeItem(header_row)
+
+        headers = {
+            str(self.list_widget.item(index).text()): index
+            for index in range(self.list_widget.count())
+            if self.list_widget.item(index).data(Qt.ItemDataRole.UserRole) is None
+        }
+        if group not in headers:
+            group_order = ("Today", "Yesterday", "Previous 7 days", "Older")
+            group_rank = group_order.index(group)
+            insert_at = self.list_widget.count()
+            for existing_group, header_row in headers.items():
+                if group_order.index(existing_group) > group_rank:
+                    insert_at = header_row
+                    break
+            header = QListWidgetItem(group)
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.list_widget.insertItem(insert_at, header)
+            header_row = insert_at
+        else:
+            header_row = headers[group]
+
+        self.list_widget.insertItem(header_row + 1, item)
+        if row_widget is not None:
+            self.list_widget.setItemWidget(item, row_widget)
+        if self._active_chat_id == item.data(Qt.ItemDataRole.UserRole):
+            self.list_widget.setCurrentItem(item)
+        self._apply_filter(self.search_input.text())
 
     def set_chat_state(
         self,
@@ -319,6 +496,8 @@ class ChatSidebar(QWidget):
         status: str | None = None,
         unread: bool | None = None,
     ) -> None:
+        if status is not None:
+            self._runtime_statuses[chat_id] = status
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             if item.data(Qt.ItemDataRole.UserRole) != chat_id:
@@ -329,9 +508,12 @@ class ChatSidebar(QWidget):
                 if unread is not None
                 else bool(item.data(Qt.ItemDataRole.UserRole + 2))
             )
-            title = item.data(Qt.ItemDataRole.UserRole + 3) or item.text()
-            display_title, _ = strip_emoji_prefix(title)
-            item.setText(display_title)
+            if (
+                current_status == item.data(Qt.ItemDataRole.UserRole + 1)
+                and current_unread == bool(item.data(Qt.ItemDataRole.UserRole + 2))
+            ):
+                return
+            title = item.data(Qt.ItemDataRole.UserRole + 3) or ""
             item.setData(Qt.ItemDataRole.UserRole + 1, current_status)
             item.setData(Qt.ItemDataRole.UserRole + 2, current_unread)
             row = self._set_row(item, title, current_status, current_unread)
@@ -345,15 +527,26 @@ class ChatSidebar(QWidget):
             row.setToolTip(tooltip)
             return
 
+    def set_active_chat(self, chat_id: str | None) -> None:
+        """Set the only chat row that should appear selected."""
+        self._active_chat_id = chat_id
+        if chat_id is not None:
+            for index in range(self.list_widget.count()):
+                item = self.list_widget.item(index)
+                if item.data(Qt.ItemDataRole.UserRole) == chat_id:
+                    self.list_widget.setCurrentItem(item)
+                    return
+        self.list_widget.setCurrentRow(-1)
+        self.list_widget.clearSelection()
+
     def set_low_power_mode(self, enabled: bool) -> None:
         self._low_power_mode = enabled
         self.refresh_list()
 
     def clear_selection(self) -> None:
-        self.list_widget.clearSelection()
+        self.set_active_chat(None)
 
     def _select_chat(self, chat_id: str, item: QListWidgetItem) -> None:
-        self.list_widget.setCurrentItem(item)
         self.chat_selected.emit(chat_id)
 
     def _apply_filter(self, query: str) -> None:
@@ -368,7 +561,7 @@ class ChatSidebar(QWidget):
                 group_item = item
                 visible_in_group = False
                 continue
-            title = str(item.data(Qt.ItemDataRole.UserRole + 3) or item.text())
+            title = str(item.data(Qt.ItemDataRole.UserRole + 3) or "")
             visible = not needle or needle in title.casefold()
             item.setHidden(not visible)
             visible_in_group = visible_in_group or visible
@@ -391,7 +584,6 @@ class ChatSidebar(QWidget):
 
     def _commit_rename(self, chat_id: str, item: QListWidgetItem, title: str) -> None:
         item.setData(Qt.ItemDataRole.UserRole + 3, title)
-        item.setText(strip_emoji_prefix(title)[0])
         self.chat_renamed.emit(chat_id, title)
 
     def _delete_chat(self, chat_id: str, item: QListWidgetItem) -> None:

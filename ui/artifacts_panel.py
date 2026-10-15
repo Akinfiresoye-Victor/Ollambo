@@ -21,12 +21,14 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
+    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -46,6 +48,7 @@ class ArtifactsPanel(QFrame):
         super().__init__(parent)
         self._files: dict[str, str] = {}
         self._tree_items: dict[str, QTreeWidgetItem] = {}
+        self._current_workspace_id: str | None = None
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setObjectName("Card")
         self._build_ui()
@@ -60,17 +63,24 @@ class ArtifactsPanel(QFrame):
         self.lbl_project_info = QLabel("")
         self.lbl_project_info.setProperty("role", "muted")
         self.lbl_project_info.setVisible(False)
-        proj_bar.addWidget(self.lbl_project_info)
-        proj_bar.addStretch()
+        proj_bar.addWidget(self.lbl_project_info, 1)
 
-        self.btn_open_folder = QPushButton("Open folder")
+        self.btn_open_folder = QToolButton()
         self.btn_open_folder.setIcon(icon("folder"))
+        self.btn_open_folder.setToolTip("Open folder")
+        self.btn_open_folder.setProperty("variant", "ghost")
+        self.btn_open_folder.setProperty("iconOnly", "true")
+        self.btn_open_folder.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_open_folder.clicked.connect(self._open_project_folder)
         self.btn_open_folder.setVisible(False)
         proj_bar.addWidget(self.btn_open_folder)
 
-        self.btn_export_zip = QPushButton("Export .zip")
+        self.btn_export_zip = QToolButton()
         self.btn_export_zip.setIcon(icon("download"))
+        self.btn_export_zip.setToolTip("Export zip")
+        self.btn_export_zip.setProperty("variant", "ghost")
+        self.btn_export_zip.setProperty("iconOnly", "true")
+        self.btn_export_zip.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_export_zip.clicked.connect(self._export_project_zip)
         self.btn_export_zip.setVisible(False)
         proj_bar.addWidget(self.btn_export_zip)
@@ -83,21 +93,33 @@ class ArtifactsPanel(QFrame):
         self.lbl_title.setProperty("role", "title")
         top_bar.addWidget(self.lbl_title)
 
+        self.lbl_count = QLabel("0 files")
+        self.lbl_count.setProperty("role", "caption")
+        self.lbl_count.setVisible(False)
+        top_bar.addWidget(self.lbl_count)
         top_bar.addSpacing(10)
         self.file_combo = QComboBox()
         self.file_combo.setMinimumWidth(180)
         self.file_combo.currentIndexChanged.connect(self._on_combo_selected)
+        self.file_combo.hide()
         top_bar.addWidget(self.file_combo)
         top_bar.addStretch()
 
-        # Action Buttons
-        self.btn_copy = QPushButton("Copy Code")
+        self.btn_copy = QToolButton()
         self.btn_copy.setIcon(icon("copy"))
+        self.btn_copy.setToolTip("Copy code")
+        self.btn_copy.setProperty("variant", "ghost")
+        self.btn_copy.setProperty("iconOnly", "true")
+        self.btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_copy.clicked.connect(self._copy_current_code)
         top_bar.addWidget(self.btn_copy)
 
-        self.btn_save = QPushButton("Save File")
+        self.btn_save = QToolButton()
         self.btn_save.setIcon(icon("download"))
+        self.btn_save.setToolTip("Save file")
+        self.btn_save.setProperty("variant", "ghost")
+        self.btn_save.setProperty("iconOnly", "true")
+        self.btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_save.clicked.connect(self._save_single_file)
         top_bar.addWidget(self.btn_save)
 
@@ -127,7 +149,6 @@ class ArtifactsPanel(QFrame):
         # Splitter: Tree navigation on left, Code viewer on right
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Left: Folder Structure Tree
         tree_container = QWidget()
         tree_layout = QVBoxLayout(tree_container)
         tree_layout.setContentsMargins(0, 0, 0, 0)
@@ -140,19 +161,83 @@ class ArtifactsPanel(QFrame):
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
         self.tree.setColumnCount(1)
+        self.tree.setAlternatingRowColors(False)
+        self.tree.setHorizontalScrollMode(self.tree.ScrollMode.ScrollPerPixel)
         self.tree.itemClicked.connect(self._on_tree_item_clicked)
         tree_layout.addWidget(self.tree)
         self.splitter.addWidget(tree_container)
 
-        # Right: Code viewer
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(4)
+
+        code_header = QHBoxLayout()
+        code_header.addStretch()
+        code_header.addWidget(self.btn_copy)
+        code_header.addWidget(self.btn_save)
+        right_layout.addLayout(code_header)
+
         self.code_viewer = QPlainTextEdit()
         self.code_viewer.setReadOnly(True)
         self.code_viewer.setProperty("role", "code")
-        self.splitter.addWidget(self.code_viewer)
+        self.code_viewer.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        right_layout.addWidget(self.code_viewer)
+        self.splitter.addWidget(right_panel)
 
         self.splitter.setSizes([200, 600])
         self.splitter.setVisible(False)
         layout.addWidget(self.splitter)
+        self.project_info_layout = proj_bar
+        self.title_actions_layout = top_bar
+        self.code_actions_layout = code_header
+
+        self.summary_widget = QWidget()
+        summary_layout = QVBoxLayout(self.summary_widget)
+        summary_layout.setContentsMargins(0, 12, 0, 0)
+        summary_layout.setSpacing(8)
+        self.summary_title = QLabel("Artifacts associated with this chat")
+        self.summary_title.setProperty("role", "section")
+        summary_layout.addWidget(self.summary_title)
+        self.summary_files = QLabel("No artifacts created in this chat yet.")
+        self.summary_files.setWordWrap(True)
+        self.summary_files.setProperty("role", "muted")
+        summary_layout.addWidget(self.summary_files)
+        self.btn_reopen_artifacts = QPushButton("Open artifacts")
+        self.btn_reopen_artifacts.setProperty("variant", "ghost")
+        self.btn_reopen_artifacts.clicked.connect(self._reopen_artifacts)
+        summary_layout.addWidget(self.btn_reopen_artifacts)
+        self.summary_widget.setVisible(False)
+        layout.addWidget(self.summary_widget)
+
+    def _reopen_artifacts(self) -> None:
+        if self._files:
+            self.summary_widget.setVisible(False)
+            self.splitter.setVisible(True)
+            self.empty_state.setVisible(False)
+        else:
+            self.empty_state.setVisible(True)
+            self.summary_widget.setVisible(False)
+            self.splitter.setVisible(False)
+
+    def show_chat_summary(self, files: dict[str, str] | list[str] | None = None) -> None:
+        names = []
+        if isinstance(files, dict):
+            names = list(files.keys())
+        elif files:
+            names = [str(item) for item in files]
+
+        if names:
+            preview = "<br>".join(f"• {name}" for name in names[:8])
+            if len(names) > 8:
+                preview += f"<br>• +{len(names) - 8} more"
+            self.summary_files.setText(preview)
+        else:
+            self.summary_files.setText("No artifacts created in this chat yet.")
+
+        self.splitter.setVisible(False)
+        self.empty_state.setVisible(False)
+        self.summary_widget.setVisible(True)
 
     def show_continuation_progress(self, filename: str, part: int, max_parts: int) -> None:
         """Show progress indicator when generating multi-part continuations."""
@@ -362,8 +447,52 @@ class ArtifactsPanel(QFrame):
             if content is not None:
                 self.add_file(f, content)
 
+        preferred = next(
+            (name for name in ("main.py", "app.py", "index.html") if name in self._files),
+            files[0] if files else "",
+        )
+        if preferred:
+            self.select_file(preferred)
+        self.lbl_title.setText(str(ws.get("name", "Project")))
         self.empty_state.setVisible(False)
         self.splitter.setVisible(True)
+
+    def select_file(self, filename: str) -> None:
+        """Select a file by its complete relative path."""
+        if filename not in self._files:
+            return
+        index = self.file_combo.findText(filename)
+        if index >= 0:
+            self.file_combo.setCurrentIndex(index)
+        self.code_viewer.setPlainText(self._files[filename])
+        item = self._tree_items.get(filename)
+        if item is not None:
+            self.tree.setCurrentItem(item)
+
+    def prepare_for_viewer(self, project_name: str) -> None:
+        """Hide the legacy panel chrome while retaining its file/tree API."""
+        self.lbl_title.setText(project_name)
+        self.lbl_count.hide()
+        self.file_combo.hide()
+        self.lbl_project_info.hide()
+        self.btn_open_folder.hide()
+        self.btn_export_zip.hide()
+        self.btn_copy.hide()
+        self.btn_save.hide()
+        self.btn_save_all.hide()
+        self.lbl_progress.hide()
+        self.empty_label.setText("No project files yet.")
+        self.empty_state.setVisible(not self._files)
+        self.summary_widget.hide()
+        self.splitter.setVisible(bool(self._files))
+        self.splitter.setSizes([260, 700])
+        self.tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        code_font = self.code_viewer.font()
+        code_font.setFamilies(list(DARK.fonts.mono))
+        code_font.setPointSize(13)
+        self.code_viewer.setFont(code_font)
+        self.code_viewer.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
 
     def clear(self) -> None:
         self._current_workspace_id = None
@@ -382,3 +511,4 @@ class ArtifactsPanel(QFrame):
             self.btn_export_zip.setVisible(False)
         self.empty_state.setVisible(True)
         self.splitter.setVisible(False)
+        self.summary_widget.setVisible(False)

@@ -150,6 +150,8 @@ def markdown_to_html(md_text: str) -> str:
     html_lines: list[str] = []
     in_ul = False
     in_ol = False
+    last_block_was_paragraph = False
+    pending_paragraph_gap = False
 
     def close_lists() -> str:
         nonlocal in_ul, in_ol
@@ -167,9 +169,25 @@ def markdown_to_html(md_text: str) -> str:
 
         # Empty line -> paragraph break
         if not line:
+            if not in_ul and not in_ol and last_block_was_paragraph:
+                pending_paragraph_gap = True
             closed = close_lists()
-            html_lines.append(f"{closed}<div style='height: 6px;'></div>")
+            if closed:
+                html_lines.append(closed)
+                last_block_was_paragraph = False
             continue
+
+        is_paragraph = not (
+            _HR_PATTERN.match(line)
+            or _HEADING_PATTERN.match(line)
+            or _QUOTE_PATTERN.match(line)
+            or _UL_PATTERN.match(line)
+            or _OL_PATTERN.match(line)
+        )
+        if pending_paragraph_gap:
+            if last_block_was_paragraph and is_paragraph:
+                html_lines.append("<div style='height: 4px;'></div>")
+            pending_paragraph_gap = False
 
         # Horizontal Rule
         if _HR_PATTERN.match(line):
@@ -178,6 +196,7 @@ def markdown_to_html(md_text: str) -> str:
                 f"{closed}<hr style='border: none; border-top: 1px solid "
                 f"{_css_color('border')}; margin: 8px 0;'>"
             )
+            last_block_was_paragraph = False
             continue
 
         # Headings
@@ -188,24 +207,25 @@ def markdown_to_html(md_text: str) -> str:
             heading_text = _format_inline(h_match.group(2))
             if level == 1:
                 html_lines.append(
-                    f"{closed}<h1 style='color: {_css_color('accent')}; font-size: 16px; "
-                    f"font-weight: bold; margin: 10px 0 4px 0;'>{heading_text}</h1>"
+                    f"{closed}<h1 style='color: {_css_color('accent')}; font-size: 20px; "
+                    f"font-weight: bold; margin: 12px 0 6px 0;'>{heading_text}</h1>"
                 )
             elif level == 2:
                 html_lines.append(
-                    f"{closed}<h2 style='color: {_css_color('accent')}; font-size: 15px; "
-                    f"font-weight: bold; margin: 8px 0 3px 0;'>{heading_text}</h2>"
+                    f"{closed}<h2 style='color: {_css_color('accent')}; font-size: 17px; "
+                    f"font-weight: bold; margin: 10px 0 5px 0;'>{heading_text}</h2>"
                 )
             elif level == 3:
                 html_lines.append(
-                    f"{closed}<h3 style='color: {_css_color('heading_subtle')}; font-size: 14px; "
-                    f"font-weight: bold; margin: 6px 0 2px 0;'>{heading_text}</h3>"
+                    f"{closed}<h3 style='color: {_css_color('accent')}; font-size: 15px; "
+                    f"font-weight: bold; margin: 8px 0 4px 0;'>{heading_text}</h3>"
                 )
             else:
                 html_lines.append(
                     f"{closed}<h4 style='color: {_css_color('primary')}; font-size: 13px; "
-                    f"font-weight: bold; margin: 4px 0 2px 0;'>{heading_text}</h4>"
+                    f"font-weight: bold; margin: 6px 0 3px 0;'>{heading_text}</h4>"
                 )
+            last_block_was_paragraph = False
             continue
 
         # Blockquote
@@ -218,6 +238,7 @@ def markdown_to_html(md_text: str) -> str:
                 f"margin: 4px 0 4px 6px; padding: 2px 0 2px 10px; "
                 f"color: {_css_color('secondary')}; font-style: italic;'>{q_text}</div>"
             )
+            last_block_was_paragraph = False
             continue
 
         # Unordered list: -, *, +
@@ -226,12 +247,13 @@ def markdown_to_html(md_text: str) -> str:
             item_text = _format_inline(ul_match.group(1))
             if not in_ul:
                 closed = close_lists()
-                html_lines.append(f"{closed}<ul style='margin: 3px 0 3px 0; padding-left: 18px;'>")
+                html_lines.append(f"{closed}<ul style='margin: 1px 0; padding-left: 20px;'>")
                 in_ul = True
             html_lines.append(
-                f"<li style='margin: 2px 0; color: {_css_color('secondary')}; "
-                f"line-height: 1.45;'>{item_text}</li>"
+                f"<li style='margin: 1px 0; color: {_css_color('secondary')}; "
+                f"line-height: 1.4;'>{item_text}</li>"
             )
+            last_block_was_paragraph = False
             continue
 
         # Ordered list: 1., 2., etc.
@@ -240,21 +262,23 @@ def markdown_to_html(md_text: str) -> str:
             item_text = _format_inline(ol_match.group(2))
             if not in_ol:
                 closed = close_lists()
-                html_lines.append(f"{closed}<ol style='margin: 3px 0 3px 0; padding-left: 18px;'>")
+                html_lines.append(f"{closed}<ol style='margin: 1px 0; padding-left: 20px;'>")
                 in_ol = True
             html_lines.append(
-                f"<li style='margin: 2px 0; color: {_css_color('secondary')}; "
-                f"line-height: 1.45;'>{item_text}</li>"
+                f"<li style='margin: 1px 0; color: {_css_color('secondary')}; "
+                f"line-height: 1.4;'>{item_text}</li>"
             )
+            last_block_was_paragraph = False
             continue
 
         # Normal paragraph text
         closed = close_lists()
         p_text = _format_inline(line)
         html_lines.append(
-            f"{closed}<p style='margin: 3px 0; line-height: 1.5; "
-            f"color: {_css_color('secondary')}; font-size: 13px;'>{p_text}</p>"
+            f"{closed}<p style='margin: 4px 0 10px 0; line-height: 1.5; "
+            f"color: {_css_color('secondary')}; font-size: 15px;'>{p_text}</p>"
         )
+        last_block_was_paragraph = True
 
     html_lines.append(close_lists())
     return "".join(html_lines)

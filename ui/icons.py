@@ -8,7 +8,7 @@ from typing import Optional
 from PySide6.QtCore import QRect, Qt, QTimer
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QWidget
 
 from ui.theme.tokens import DARK
 
@@ -91,7 +91,7 @@ def icon(name: str, color: Optional[str] = None, size: int = 18) -> QIcon:
 
 
 class Spinner(QWidget):
-    """Rotating loader icon that pauses while hidden or in low-power mode."""
+    """Rotating loader icon that pauses while hidden. Low-power mode slows it to 400ms steps."""
 
     def __init__(
         self,
@@ -106,7 +106,7 @@ class Spinner(QWidget):
         self._angle = 0
         self._low_power_mode = low_power_mode
         self._timer = QTimer(self)
-        self._timer.setInterval(62)
+        self._timer.setInterval(62 if not low_power_mode else 400)
         self._timer.timeout.connect(self._rotate)
         self.setFixedSize(self._size, self._size)
 
@@ -116,6 +116,7 @@ class Spinner(QWidget):
 
     def set_low_power_mode(self, enabled: bool) -> None:
         self._low_power_mode = enabled
+        self._timer.setInterval(400 if enabled else 62)
         self._sync_timer()
 
     def showEvent(self, event) -> None:
@@ -127,14 +128,14 @@ class Spinner(QWidget):
         super().hideEvent(event)
 
     def _sync_timer(self) -> None:
-        if self.isVisible() and not self._low_power_mode:
+        if self.isVisible():
             if not self._timer.isActive():
                 self._timer.start()
         else:
             self._timer.stop()
 
     def _rotate(self) -> None:
-        self._angle = (self._angle + 22.5) % 360
+        self._angle = (self._angle + (90 if self._low_power_mode else 22.5)) % 360
         self.update()
 
     def paintEvent(self, event) -> None:
@@ -148,3 +149,63 @@ class Spinner(QWidget):
             QRect(-side // 2, -side // 2, side, side),
         )
         painter.end()
+
+
+class StatusIcon(QLabel):
+    """A fixed-size status glyph that can animate as a spinner or show a static check/x/error."""
+
+    def __init__(
+        self,
+        size: int = 16,
+        color: Optional[str] = None,
+        low_power_mode: bool = False,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._size = max(1, size)
+        self._color = color or DARK.colors.text_secondary
+        self._spinner = Spinner(self._size, self._color, low_power_mode=low_power_mode, parent=self)
+        self._spinner.setVisible(False)
+        self.setFixedSize(self._size, self._size)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    @property
+    def spinner(self) -> Spinner:
+        return self._spinner
+
+    def set_color(self, color: str) -> None:
+        self._color = color
+        self._spinner._color = color
+        if self._spinner.isVisible():
+            self._spinner.update()
+        elif self.pixmap() is not None and not self.pixmap().isNull():
+            last_name = getattr(self, "_last_static_name", "message")
+            self.setPixmap(icon(last_name, color, self._size).pixmap(self._size, self._size))
+
+    def set_low_power_mode(self, enabled: bool) -> None:
+        self._spinner.set_low_power_mode(enabled)
+
+    def set_state(self, state: str) -> None:
+        if state == "loading":
+            self._spinner.setVisible(True)
+            self._spinner.show()
+            self.clear()
+            return
+        self._spinner.hide()
+        self._spinner.setVisible(False)
+        if state == "idle":
+            self.clear()
+            return
+        icon_name = {
+            "ok": "check",
+            "failed": "alert-triangle",
+            "warning": "alert-triangle",
+            "message": "message",
+            "search": "search",
+            "read": "file",
+            "fetch": "external-link",
+            "check": "check",
+        }.get(state, state)
+        self._last_static_name = icon_name
+        pix = icon(icon_name, self._color, self._size).pixmap(self._size, self._size)
+        self.setPixmap(pix)

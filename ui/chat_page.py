@@ -6,6 +6,7 @@ Background Builds with Persistent Sessions, and Keep-Alive Model Connection.
 
 from __future__ import annotations
 
+import copy
 from functools import partial
 import time
 import uuid
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSplitter,
     QStackedWidget,
+    QTabWidget,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
@@ -45,6 +47,9 @@ from core.task_classifier import classify_heuristic
 from core.walkthrough import generate_project_walkthrough
 from core.chat_session import ChatSession
 from ui.artifacts_panel import ArtifactsPanel
+from ui.widgets.artifact_card import ArtifactCard
+from ui.artifact_list import ArtifactListPanel
+from ui.artifact_viewer import ArtifactViewer
 from ui.background_workers import (
     ClassifyWorker,
     ContextLengthWorker,
@@ -105,6 +110,7 @@ class ChatPage(QWidget):
         self._models: list[str] = []
         self._current_chat_id = str(uuid.uuid4())
         self._controllers: dict[str, SessionController] = {}
+        self._saved_chat_signatures: dict[str, tuple[Any, ...]] = {}
         self._view_last_used: dict[str, float] = {}
         self._deleted_chat_ids: set[str] = set()
         self._active_title_workers: list[TitleWorker] = []
@@ -393,6 +399,7 @@ class ChatPage(QWidget):
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         self.shell_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.shell_splitter.setHandleWidth(1)
         main_layout.addWidget(self.shell_splitter)
 
         # Left Sidebar
@@ -422,6 +429,9 @@ class ChatPage(QWidget):
         self.top_bar.mode_changed.connect(lambda m: self._settings.update({"coding_mode": m}))
         self.top_bar.keep_warm_requested.connect(self._on_keep_warm_requested)
         self.top_bar.connection_expired.connect(self._on_connection_expired)
+        self.top_bar.sidebar_toggle_requested.connect(self._toggle_sidebar)
+        self.top_bar.inspector_toggle_requested.connect(self._toggle_inspector)
+        self.top_bar.artifacts_requested.connect(self._show_artifact_popover)
         self.top_bar.set_mode(self._settings.get("coding_mode", "auto"))
         self.top_bar.set_low_power_mode(bool(self._settings.get("low_power_mode", False)))
         self.sidebar.set_low_power_mode(bool(self._settings.get("low_power_mode", False)))
@@ -446,6 +456,8 @@ class ChatPage(QWidget):
 
         self.research_panel = ResearchPanel()
         self.research_panel.resume_requested.connect(self._resume_research)
+        self.chat_artifacts_panel = ArtifactListPanel("No artifacts in this chat yet.")
+        self.chat_artifacts_panel.open_requested.connect(self._open_artifact_viewer)
 
         center_row = QHBoxLayout()
         center_row.setContentsMargins(0, 0, 0, 0)
@@ -453,6 +465,7 @@ class ChatPage(QWidget):
         center_row.addWidget(self.chat_views_stack, 1)
 
         self.inspector = QWidget()
+        self.inspector.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.inspector.setObjectName("Inspector")
         self.inspector.setFixedWidth(DARK.sizes.inspector_width)
         inspector_layout = QVBoxLayout(self.inspector)
@@ -463,7 +476,7 @@ class ChatPage(QWidget):
         self.btn_inspector_plan = QPushButton("Plan")
         self.btn_inspector_plan.setIcon(icon("list-checks"))
         self.btn_inspector_plan.setCheckable(True)
-        self.btn_inspector_files = QPushButton("Files")
+        self.btn_inspector_files = QPushButton("Artifacts")
         self.btn_inspector_files.setIcon(icon("package"))
         self.btn_inspector_files.setCheckable(True)
         for button in (self.btn_inspector_plan, self.btn_inspector_files):
@@ -476,6 +489,7 @@ class ChatPage(QWidget):
         self.btn_inspector_close.setToolTip("Close inspector (Ctrl+Shift+B)")
         self.btn_inspector_close.setProperty("variant", "ghost")
         self.btn_inspector_close.setProperty("iconOnly", "true")
+        self.btn_inspector_close.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_inspector_close.clicked.connect(self._toggle_inspector)
         inspector_header.addStretch()
         inspector_header.addWidget(self.btn_inspector_close)
@@ -483,7 +497,7 @@ class ChatPage(QWidget):
 
         self.inspector_stack = QStackedWidget()
         self.inspector_stack.addWidget(self.plan_stack)
-        self.inspector_stack.addWidget(self.artifacts_panel)
+        self.inspector_stack.addWidget(self.chat_artifacts_panel)
         inspector_layout.addWidget(self.inspector_stack, 1)
         self.inspector.hide()
         center_row.addWidget(self.inspector)
@@ -499,7 +513,19 @@ class ChatPage(QWidget):
         library_header.addWidget(back_to_chat)
         library_header.addStretch()
         library_layout.addLayout(library_header)
-        library_layout.addWidget(self.research_panel, 1)
+
+        self.library_artifacts_panel = ArtifactListPanel(
+            "No projects in the Library yet.",
+            filterable=True,
+        )
+        self.library_artifacts_panel.open_requested.connect(self._open_artifact_viewer)
+        self._refresh_library_artifacts()
+
+        self.library_tabs = QTabWidget()
+        self.library_tabs.setTabPosition(QTabWidget.TabPosition.North)
+        self.library_tabs.addTab(self.research_panel, "Research")
+        self.library_tabs.addTab(self.library_artifacts_panel, "Artifacts")
+        library_layout.addWidget(self.library_tabs, 1)
 
         self.page_stack.addWidget(self.chat_workspace)
         self.page_stack.addWidget(library_page)
@@ -509,7 +535,7 @@ class ChatPage(QWidget):
             library_page,
             self.inspector_stack,
             self.plan_stack,
-            self.artifacts_panel,
+            self.chat_artifacts_panel,
             self.inspector,
         )
         self.plan_panel.plan_rejected.connect(self.navigation.show_chat)
@@ -526,6 +552,7 @@ class ChatPage(QWidget):
 
         # Removable Attachment Chips Bar
         self.attachment_bar = QWidget()
+        self.attachment_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.attachment_bar_layout = QHBoxLayout(self.attachment_bar)
         self.attachment_bar_layout.setContentsMargins(4, 2, 4, 2)
         self.attachment_bar_layout.setSpacing(6)
@@ -559,7 +586,70 @@ class ChatPage(QWidget):
         )
         for sequence, callback in shortcuts:
             shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
             shortcut.activated.connect(callback)
+
+    def _refresh_library_artifacts(self) -> None:
+        busy_id = self._building_workspace_id if self._build_running else None
+        self.library_artifacts_panel.set_projects(
+            workspace.list_workspaces(kind="code"),
+            busy_id,
+        )
+
+    def _refresh_chat_artifacts(self, chat_id: str) -> list[dict]:
+        projects = workspace.list_workspaces_for_chat(chat_id)
+        controller = self._controllers.get(chat_id)
+        if controller is not None:
+            history = set(controller.session.workspace_ids_history)
+            if controller.session.workspace_id:
+                history.add(controller.session.workspace_id)
+            known = {str(project.get("id") or project.get("slug")) for project in projects}
+            if history - known:
+                projects = [
+                    project
+                    for project in workspace.list_workspaces(kind="code")
+                    if str(project.get("id") or project.get("slug")) in history
+                ] + projects
+                projects = list({str(p.get("id") or p.get("slug")): p for p in projects}.values())
+        busy_id = self._building_workspace_id if self._building_chat_id == chat_id else None
+        if chat_id == self._current_chat_id:
+            self.chat_artifacts_panel.set_projects(projects, busy_id)
+            self.top_bar.set_artifact_count(len(projects))
+        self._refresh_library_artifacts()
+        return projects
+
+    def _show_artifact_popover(self) -> None:
+        chat_id = self._current_chat_id
+        projects = self._refresh_chat_artifacts(chat_id)
+        menu = QMenu(self)
+        if projects:
+            for project in projects:
+                action = menu.addAction(icon("folder"), str(project.get("name") or "Project"))
+                workspace_id = str(project.get("id") or project.get("slug") or "")
+                action.triggered.connect(
+                    lambda checked=False, wid=workspace_id: self._open_artifact_viewer(wid)
+                )
+        else:
+            empty = menu.addAction("No artifacts in this chat yet")
+            empty.setEnabled(False)
+        menu.addSeparator()
+        library_action = menu.addAction("Show all in Library")
+        library_action.triggered.connect(self._show_artifact_library)
+        menu.popup(self.top_bar.btn_artifacts.mapToGlobal(
+            self.top_bar.btn_artifacts.rect().bottomLeft()
+        ))
+
+    def _show_artifact_library(self) -> None:
+        self._refresh_library_artifacts()
+        self.library_tabs.setCurrentWidget(self.library_artifacts_panel)
+        self.navigation.show_library()
+
+    def _open_artifact_viewer(self, workspace_id: str) -> None:
+        host = self.window().centralWidget()
+        if host is None:
+            return
+        viewer = ArtifactViewer(host)
+        viewer.open_workspace(workspace_id)
 
     def _show_chat(self) -> None:
         self.navigation.show_chat()
@@ -571,6 +661,8 @@ class ChatPage(QWidget):
         self.btn_inspector_files.setChecked(False)
 
     def _show_files(self) -> None:
+        self.inspector.setFixedWidth(DARK.sizes.inspector_width)
+        self._refresh_chat_artifacts(self._current_chat_id)
         self.navigation.show_files()
         self.btn_inspector_plan.setChecked(False)
         self.btn_inspector_files.setChecked(True)
@@ -583,7 +675,7 @@ class ChatPage(QWidget):
     def _toggle_inspector(self) -> None:
         if self.inspector.isVisible():
             self.inspector.hide()
-        elif self.inspector_stack.currentWidget() is self.artifacts_panel:
+        elif self.inspector_stack.currentWidget() is self.chat_artifacts_panel:
             self._show_files()
         else:
             self._show_plan()
@@ -622,9 +714,10 @@ class ChatPage(QWidget):
             self._on_controller_persist_needed(controller)
             return
         if data := load_chat(chat_id):
-            data["title"] = title
-            data["ai_title"] = True
-            save_chat(data)
+            if data.get("title") != title:
+                data["title"] = title
+                data["ai_title"] = True
+                save_chat(data)
         self.sidebar.refresh_list()
 
     def _create_session_controller(
@@ -656,6 +749,9 @@ class ChatPage(QWidget):
             lambda cid, unread: self.sidebar.set_chat_state(cid, unread=unread)
         )
         self._controllers[session.id] = controller
+        self._saved_chat_signatures[session.id] = self._chat_save_signature(
+            controller.persist_dict()
+        )
         self._ensure_chat_view(controller)
         return controller
 
@@ -683,6 +779,7 @@ class ChatPage(QWidget):
         if previous is not None and previous is not controller:
             previous.set_visible(False)
         self._current_chat_id = controller.chat_id
+        self.sidebar.set_active_chat(controller.chat_id)
         view = self._ensure_chat_view(controller)
         controller.set_visible(True)
         self._view_last_used[controller.chat_id] = time.monotonic()
@@ -691,7 +788,41 @@ class ChatPage(QWidget):
         self.history_container = view.history_container
         self.history_layout = view.history_layout
         self._apply_view_limit()
+        self._update_sidebar_session(controller.chat_id)
+        projects = self._refresh_chat_artifacts(controller.chat_id)
+        for project in projects:
+            self._upsert_inline_artifact_card(
+                controller,
+                str(project.get("id") or project.get("slug") or ""),
+                self._building_chat_id == controller.chat_id
+                and str(project.get("id") or project.get("slug") or "") == self._building_workspace_id,
+            )
         self._sync_active_controls()
+
+    def _upsert_inline_artifact_card(
+        self,
+        controller: SessionController,
+        workspace_id: str,
+        busy: bool,
+    ) -> None:
+        project = workspace.get_workspace(workspace_id)
+        if project is None:
+            return
+        view = self._ensure_chat_view(controller)
+        for index in range(view.history_layout.count()):
+            old = view.history_layout.itemAt(index).widget()
+            if (
+                isinstance(old, ArtifactCard)
+                and old.property("workspaceId") == workspace_id
+            ):
+                view.history_layout.removeWidget(old)
+                old.deleteLater()
+                break
+        card = ArtifactCard(project, busy=busy, parent=view.history_container)
+        card.setObjectName("InlineArtifactCard")
+        card.setProperty("workspaceId", workspace_id)
+        card.open_requested.connect(self._open_artifact_viewer)
+        view.history_layout.insertWidget(view.history_layout.count() - 1, card)
 
     def _apply_view_limit(self) -> None:
         live = [
@@ -767,12 +898,26 @@ class ChatPage(QWidget):
             data["artifacts"] = dict(session.build_files)
         if controller.view is not None:
             controller.view.update_message_model(session.messages)
-        save_chat(data)
+        signature = self._chat_save_signature(data)
+        saved_signature = self._saved_chat_signatures.get(controller.chat_id)
+        previous_messages = saved_signature[0] if saved_signature is not None else []
+        new_message = len(data["messages"]) > len(previous_messages)
+        if saved_signature != signature:
+            save_chat(data)
+            self._saved_chat_signatures[controller.chat_id] = signature
         self.sidebar.upsert_chat(
             controller.chat_id,
             title,
             status=session.status,
             unread=session.unread,
+            new_message=new_message,
+        )
+
+    @staticmethod
+    def _chat_save_signature(data: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple(
+            copy.deepcopy(data.get(key))
+            for key in ("messages", "title", "plan", "status")
         )
 
     def _save_streaming_drafts(self) -> None:
@@ -1046,9 +1191,7 @@ class ChatPage(QWidget):
         if workspaces:
             for ws in workspaces:
                 name = ws.get("name", "Untitled")
-                cnt = ws.get("file_count", len(ws.get("files", {})))
-                dt = ws.get("updated", "")[:10] or ws.get("created", "")[:10]
-                act = self.artifacts_submenu.addAction(icon("file-code"), f"{name} ({cnt} files, {dt})")
+                act = self.artifacts_submenu.addAction(icon("folder"), name)
                 wid = ws.get("id")
                 act.triggered.connect(lambda checked=False, w_id=wid, w_name=name: self._add_attachment(w_id, w_name, "code"))
 
@@ -1082,6 +1225,7 @@ class ChatPage(QWidget):
 
         for att in self._pending_attachments:
             chip = QWidget()
+            chip.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
             chip.setProperty("role", "card")
             chip.setObjectName("AttachmentChip")
             chip_layout = QHBoxLayout(chip)
@@ -1101,6 +1245,7 @@ class ChatPage(QWidget):
             btn_del.setToolTip("Remove attachment")
             set_variant(btn_del, "danger")
             set_property(btn_del, "iconOnly", "true")
+            btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
             att_id = att["id"]
             btn_del.clicked.connect(lambda checked=False, a_id=att_id: self._remove_attachment(a_id))
             chip_layout.addWidget(btn_del)
@@ -1145,6 +1290,7 @@ class ChatPage(QWidget):
     def _on_chat_deleted(self, chat_id: str) -> None:
         """Handle a chat being deleted from the sidebar."""
         controller = self._controllers.pop(chat_id, None)
+        self._saved_chat_signatures.pop(chat_id, None)
         was_current = chat_id == self._current_chat_id
         if controller:
             if controller.is_busy():
@@ -1182,6 +1328,9 @@ class ChatPage(QWidget):
             controller = self._create_session_controller(session)
             if saved_plan := data.get("plan"):
                 controller.coding_plan = reconstruct_plan(saved_plan)
+                self._saved_chat_signatures[chat_id] = self._chat_save_signature(
+                    controller.persist_dict()
+                )
 
         self._activate_controller(controller)
         self.navigation.show_chat()
@@ -1205,33 +1354,12 @@ class ChatPage(QWidget):
             self._show_files()
         else:
             self.artifacts_panel.clear()
-            old_artifacts = data.get("artifacts", {})
-
-            if self._workspace_id:
-                self._build_files = workspace.read_all(self._workspace_id)
-                self.artifacts_panel.load_workspace(self._workspace_id)
-            elif old_artifacts:
-                # Migration: old chat stored file contents inline — create a workspace for them
-                plan_goal = ""
-                if saved_plan := data.get("plan"):
-                    plan_goal = saved_plan.get("goal", "")
-                name = plan_goal or data.get("title") or "migrated-project"
-                ws = workspace.create_workspace(name, goal=plan_goal, kind="code", chat_id=chat_id)
-                self._workspace_id = ws.get("id")
-                for fname, code in old_artifacts.items():
-                    try:
-                        workspace.write_file(self._workspace_id, fname, code)
-                    except Exception:
-                        pass
-                self._build_files = dict(old_artifacts)
+            self._build_files = dict(controller.session.build_files)
+            if self._build_files:
                 for fname, code in self._build_files.items():
                     self.artifacts_panel.add_file(fname, code)
-                # Persist the migrated workspace_id and clear old artifacts
-                data["workspace_id"] = self._workspace_id
-                data["artifacts"] = {}
-                save_chat(data)
             else:
-                self._build_files = {}
+                self.artifacts_panel.show_chat_summary([])
 
             if saved_plan := data.get("plan"):
                 self._active_plan = controller.coding_plan or reconstruct_plan(saved_plan)
@@ -1253,7 +1381,7 @@ class ChatPage(QWidget):
 
             if work_session := load_session(chat_id):
                 self._restore_session(work_session)
-                self._show_files()
+                self._show_files() if self._build_files else self.navigation.show_chat()
             else:
                 self._show_files() if self._build_files else self.navigation.show_chat()
 
@@ -1261,22 +1389,18 @@ class ChatPage(QWidget):
         self._scroll_to_bottom()
 
     def _restore_session(self, session: dict) -> None:
-        """Restore a saved work session: show artifacts, mark plan steps, offer resume."""
+        """Restore a saved work session: show artifacts scoped to this chat, mark plan steps, offer resume."""
         plan = reconstruct_plan(session)
         self._active_plan = plan
-        # Prefer workspace files on disk; fall back to session's completed_files
-        ws_id = session.get("workspace_id") or self._workspace_id
-        if ws_id:
-            self._workspace_id = ws_id
-            self._build_files = workspace.read_all(ws_id)
-        else:
+        self._build_files = dict(self._active_controller.session.build_files)
+        if not self._build_files:
             self._build_files = dict(session.get("completed_files", {}))
         self.artifacts_panel.clear()
-        if ws_id:
-            self.artifacts_panel.load_workspace(ws_id)
-        else:
+        if self._build_files:
             for fname, code in self._build_files.items():
                 self.artifacts_panel.add_file(fname, code)
+        else:
+            self.artifacts_panel.show_chat_summary([])
         self.plan_panel.set_plan(plan)
         for s in plan.steps:
             if s.completed:
@@ -2162,6 +2286,14 @@ class ChatPage(QWidget):
 
         self._building_files = dict(self._build_files)
         self._building_workspace_id = self._workspace_id
+        if self._building_workspace_id:
+            workspace.link_chat(self._building_workspace_id, self._building_chat_id)
+            self._refresh_chat_artifacts(self._building_chat_id)
+            self._upsert_inline_artifact_card(
+                self._active_controller,
+                self._building_workspace_id,
+                busy=True,
+            )
         self._active_controller.session.status = "building"
         self._update_sidebar_session(self._current_chat_id)
 
@@ -2269,6 +2401,16 @@ class ChatPage(QWidget):
             total = len(self._building_plan.steps) if self._building_plan else 1
             pct = int((step_num / total) * 100) if total else 0
             self.top_bar.show_status(f"{filename} ({step_num}/{total})", pct)
+        self._refresh_chat_artifacts(target_id)
+        workspace_id = self._building_workspace_id or (
+            target_controller.session.workspace_id if target_controller is not None else None
+        )
+        if target_controller is not None and target_controller.view is not None and workspace_id:
+            self._upsert_inline_artifact_card(
+                target_controller,
+                workspace_id,
+                busy=True,
+            )
 
     @Slot(dict)
     def _on_all_files_completed(self, files: dict[str, str]) -> None:
@@ -2329,6 +2471,9 @@ class ChatPage(QWidget):
         self._building_files = {}
         self._building_workspace_id = None
         self._deleted_chat_ids.discard(target_id)
+        self._refresh_chat_artifacts(target_id)
+        if target_controller is not None and ws_id:
+            self._upsert_inline_artifact_card(target_controller, ws_id, busy=False)
         self._sync_active_controls()
 
     @Slot(str)
@@ -2345,6 +2490,7 @@ class ChatPage(QWidget):
             self._deleted_chat_ids.discard(target_id)
             return
         self._build_running = False
+        failed_workspace_id = self._building_workspace_id
 
         err = f"Build error: {err_msg}\nProgress saved — click **Resume Building** in Plan tab."
         target_controller = self._controllers.get(target_id)
@@ -2382,6 +2528,13 @@ class ChatPage(QWidget):
         self._building_plan = None
         self._building_files = {}
         self._building_workspace_id = None
+        self._refresh_chat_artifacts(target_id)
+        if target_controller is not None and failed_workspace_id:
+            self._upsert_inline_artifact_card(
+                target_controller,
+                failed_workspace_id,
+                busy=False,
+            )
         self._sync_active_controls()
 
     @Slot(str)
@@ -2582,9 +2735,10 @@ class ChatPage(QWidget):
         if controller:
             self._on_controller_persist_needed(controller)
         elif c_data := existing_data:
-            c_data["title"] = title
-            c_data["ai_title"] = True
-            save_chat(c_data)
+            if c_data.get("title") != title:
+                c_data["title"] = title
+                c_data["ai_title"] = True
+                save_chat(c_data)
         self.sidebar.upsert_chat(chat_id, title)
 
     def _on_scroll_value_changed(self, value: int) -> None:

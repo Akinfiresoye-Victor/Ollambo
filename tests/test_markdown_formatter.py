@@ -69,6 +69,15 @@ class TestMarkdownFormatter(unittest.TestCase):
         self.assertIn("First step", ol_html)
         self.assertIn("Second step", ol_html)
 
+    def test_list_spacing_and_paragraph_typography(self):
+        html = markdown_to_html("- First\n\n- Second\n\nParagraph one.\n\nParagraph two.")
+        self.assertIn("padding-left: 20px", html)
+        self.assertIn("margin: 1px 0;", html)
+        self.assertIn("line-height: 1.4;", html)
+        self.assertIn("line-height: 1.5;", html)
+        self.assertNotIn("</li><div style='height:", html)
+        self.assertIn("<div style='height: 4px;'></div>", html)
+
     def test_markdown_blockquote_and_hr(self):
         text = "> Important advice\n---\nFinal thought"
         html = markdown_to_html(text)
@@ -93,6 +102,13 @@ class TestMarkdownFormatter(unittest.TestCase):
         # Final render
         widget.set_content("### Final Title\nDone **stream**.", is_final=True)
         self.assertIn("Final Title", widget.get_content())
+
+    def test_legacy_emoji_prefix_is_removed_only_from_assistant_display(self):
+        content = f"{chr(0x1F680)} Build complete."
+        widget = ChatMessageWidget("assistant", content)
+
+        self.assertEqual(widget.get_content(), content)
+        self.assertIn("Build complete.", widget._blocks[0]["widget"].toPlainText())
 
 
 if __name__ == "__main__":

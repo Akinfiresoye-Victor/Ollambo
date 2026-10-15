@@ -12,6 +12,8 @@ Features:
 from __future__ import annotations
 
 import re
+from math import ceil
+
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import (
 from core.markdown_formatter import markdown_to_html
 from ui.icons import icon
 from ui.theme import set_variant
+from ui.text_utils import strip_emoji_prefix
 from ui.widgets.auto_text_view import AutoTextView
 
 
@@ -166,28 +169,51 @@ class ChatMessageWidget(QFrame):
         self._layout.setSpacing(6)
 
         self._content_container = QWidget()
-        self._content_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._content_container.setSizePolicy(
+            QSizePolicy.Policy.Preferred if is_user else QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
         self._content_layout = QVBoxLayout(self._content_container)
-        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        if is_user:
+            self._content_layout.setContentsMargins(14, 10, 14, 10)
+        else:
+            self._content_layout.setContentsMargins(0, 0, 0, 0)
         self._content_layout.setSpacing(4)
+        self._user_bubble = is_user
 
         if not is_user:
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(8)
+            row.setAlignment(Qt.AlignmentFlag.AlignTop)
             from core.assets import get_app_pixmap
             pix = get_app_pixmap(18)
             if not pix.isNull():
                 av = QLabel()
                 av.setPixmap(pix)
                 av.setFixedSize(18, 18)
-                row.addWidget(av)
+                av.setAlignment(Qt.AlignmentFlag.AlignTop)
+                row.addWidget(av, 0, Qt.AlignmentFlag.AlignTop)
+            self._content_container.setMaximumWidth(760)
             row.addWidget(self._content_container, 1)
             self._layout.addLayout(row)
         else:
-            self._layout.addWidget(self._content_container)
+            self._content_container.setObjectName("UserMessageBubble")
+            self._content_container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            self._content_container.setMinimumWidth(0)
+            self._content_container.setMaximumWidth(608)
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addStretch()
+            row.addWidget(
+                self._content_container,
+                0,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
+            )
+            self._layout.addLayout(row)
 
         self.set_content(content, is_final=bool(content))
+        self._update_user_bubble_width()
 
         # Attachment chips if present
         if self._attachments:
@@ -210,7 +236,11 @@ class ChatMessageWidget(QFrame):
     def set_content(self, new_content: str, is_final: bool = False) -> None:
         """Update content in-place with zero widget flickering."""
         # Skip re-render if content unchanged (common during rapid flush ticks)
-        if new_content == self._content and not is_final:
+        if (
+            new_content == self._content
+            and not is_final
+            and (new_content.strip() or self._placeholder is not None)
+        ):
             return
         self._content = new_content
 
@@ -218,7 +248,9 @@ class ChatMessageWidget(QFrame):
             if not self._placeholder:
                 self._clear_all_blocks()
                 self._placeholder = ThinkingIndicator()
+                self._placeholder.setFixedHeight(20)
                 self._content_layout.addWidget(self._placeholder)
+                self.updateGeometry()
             return
 
         if self._placeholder:
@@ -226,10 +258,44 @@ class ChatMessageWidget(QFrame):
             self._placeholder.deleteLater()
             self._placeholder = None
 
-        segments = self._parse_segments(new_content)
+        display_content = new_content
+        if self.role == "assistant":
+            cleaned_content, _ = strip_emoji_prefix(new_content)
+            if cleaned_content.startswith(("Plan Ready", "Build")):
+                display_content = cleaned_content
+        segments = self._parse_segments(display_content)
         self._sync_segments_to_ui(segments, is_final=is_final)
 
+        self._update_user_bubble_width()
         self.updateGeometry()
+
+    def _update_user_bubble_width(self) -> None:
+        if not self._user_bubble:
+            return
+        column_width = min(self.width(), 760)
+        if column_width <= 0:
+            return
+
+        max_width = int(column_width * 0.8)
+        content_width = 0
+        for block in self._blocks:
+            widget = block["widget"]
+            if isinstance(widget, AutoTextView):
+                doc = widget.document()
+                doc.setTextWidth(-1)
+                content_width = max(content_width, ceil(doc.idealWidth()))
+            else:
+                content_width = max(content_width, widget.sizeHint().width())
+
+        margins = self._content_layout.contentsMargins()
+        horizontal_padding = margins.left() + margins.right() + 2
+        self._content_container.setMaximumWidth(
+            min(max_width, content_width + horizontal_padding)
+        )
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_user_bubble_width()
 
     def _parse_segments(self, text: str) -> list[dict]:
         """Parse raw markdown into segments, caching completed blocks to avoid regex over unchanged text."""

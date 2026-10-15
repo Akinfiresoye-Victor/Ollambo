@@ -150,6 +150,20 @@ class TestWorkspace(unittest.TestCase):
         workspaces = list_workspaces()
         self.assertEqual(len(workspaces), 2)
 
+    def test_list_workspaces_for_chat_uses_links_and_saved_history(self):
+        linked = create_workspace("Linked", chat_id="chat-a")
+        historical = create_workspace("Historical", chat_id="chat-b")
+        ignored = create_workspace("Other", kind="research", chat_id="chat-a")
+
+        with patch("core.storage.load_chat", return_value={
+            "workspace_ids_history": [historical["id"]],
+        }):
+            found = workspace.list_workspaces_for_chat("chat-a")
+
+        self.assertEqual({ws["id"] for ws in found}, {linked["id"], historical["id"]})
+        self.assertNotIn(ignored["id"], {ws["id"] for ws in found})
+        self.assertEqual(workspace.list_workspaces_for_chat(""), [])
+
     def test_router_decisions(self):
         game_summary = {
             "id": "game-123",

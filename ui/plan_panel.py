@@ -71,6 +71,10 @@ class PlanPanel(QFrame):
         layout.addWidget(lbl_steps)
 
         self.list_steps = QListWidget()
+        self.list_steps.setWordWrap(True)
+        self.list_steps.setAlternatingRowColors(False)
+        self.list_steps.setSpacing(2)
+        self.list_steps.setStyleSheet("QListWidget::item { margin: 2px 0; }")
         layout.addWidget(self.list_steps)
 
         # Raw notes / assumptions box (collapsible or small)
@@ -127,6 +131,7 @@ class PlanPanel(QFrame):
             item = QListWidgetItem(text)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if s.completed else Qt.CheckState.Unchecked)
+            item.setSizeHint(self.list_steps.sizeHint())
             self.list_steps.addItem(item)
 
     def mark_step_completed(self, step_number: int) -> None:

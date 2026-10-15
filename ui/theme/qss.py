@@ -55,8 +55,13 @@ def build_stylesheet(theme: Theme = DARK) -> str:
             border: 1px solid {c.border_subtle};
             border-radius: {r.card}px;
         }}
-        QFrame[messageRole="user"] {{ background-color: {c.raised}; border: 1px solid {c.border_subtle}; border-radius: {r.card}px; }}
+        QFrame[messageRole="user"] {{ background-color: transparent; border: none; }}
         QFrame[messageRole="assistant"] {{ background-color: transparent; border: none; border-radius: 0; }}
+        QWidget#UserMessageBubble {{
+            background-color: {c.raised};
+            border: 1px solid {c.border_subtle};
+            border-radius: {r.card}px;
+        }}
         QWidget#AttachmentChip {{
             background-color: {c.raised};
             border: 1px solid {c.border};
@@ -125,7 +130,7 @@ def build_stylesheet(theme: Theme = DARK) -> str:
             min-width: {s.control_height}px;
             padding: 0 12px;
         }}
-        QPushButton:hover, QToolButton:hover {{ background-color: {c.raised}; }}
+        QPushButton:hover, QToolButton:hover {{ background-color: {c.raised}; border-color: {c.border}; }}
         QPushButton:pressed, QToolButton:pressed {{ background-color: {c.border}; }}
         QPushButton:focus, QToolButton:focus,
         QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus,
@@ -137,19 +142,47 @@ def build_stylesheet(theme: Theme = DARK) -> str:
             background-color: {c.window};
             border-color: {c.border_subtle};
         }}
-        QPushButton[variant="primary"] {{
+        QPushButton[variant="primary"], QToolButton[variant="primary"] {{
             color: {c.text_on_accent};
             background-color: {c.accent};
             border-color: {c.accent};
             font-weight: 600;
         }}
-        QPushButton[variant="primary"]:hover {{
+        QPushButton[variant="primary"]:hover, QToolButton[variant="primary"]:hover {{
             background-color: {c.accent_hover};
             border-color: {c.accent_hover};
+        }}
+        QPushButton[variant="primary"]:disabled, QToolButton[variant="primary"]:disabled {{
+            color: {c.text_on_accent};
+            background-color: {c.accent_hover};
+            border-color: {c.accent_hover};
+            opacity: 0.7;
         }}
         QPushButton[variant="ghost"], QToolButton[variant="ghost"] {{
             background-color: transparent;
             border-color: transparent;
+        }}
+        QPushButton[variant="ghost"]:hover, QToolButton[variant="ghost"]:hover {{
+            background-color: {c.raised};
+            border: 1px solid {c.border_subtle};
+        }}
+        QPushButton[variant="ghost"]:pressed, QToolButton[variant="ghost"]:pressed {{
+            background-color: {c.raised};
+            border: 1px solid {c.border};
+        }}
+        QPushButton[variant="ghost"]:focus, QToolButton[variant="ghost"]:focus {{
+            border: 1px solid {c.accent};
+        }}
+        QComboBox[role="chip"] {{
+            background-color: transparent;
+            border: 1px solid transparent;
+            border-radius: {r.control}px;
+            padding: 0 10px;
+            min-height: {s.control_height}px;
+        }}
+        QComboBox[role="chip"]:hover {{
+            background-color: {c.raised};
+            border-color: {c.border_subtle};
         }}
         QPushButton[variant="danger"] {{
             color: {c.danger};
@@ -170,6 +203,11 @@ def build_stylesheet(theme: Theme = DARK) -> str:
             selection-background-color: {c.accent};
             selection-color: {c.text_on_accent};
         }}
+        QTextBrowser[role="body"] {{
+            background: transparent;
+            border: none;
+            padding: 0;
+        }}
         QWidget#Composer {{
             background-color: {c.surface};
             border: 1px solid {c.border};
@@ -185,6 +223,7 @@ def build_stylesheet(theme: Theme = DARK) -> str:
             min-width: 32px;
             max-width: 32px;
         }}
+        QToolButton::menu-indicator {{ image: none; width: 0; }}
         QLineEdit, QComboBox, QSpinBox {{ height: {s.control_height}px; }}
         QPlainTextEdit[role="code"] {{
             border-color: {c.border_subtle};
@@ -277,6 +316,11 @@ def build_stylesheet(theme: Theme = DARK) -> str:
             background-color: {c.raised};
             border: 0;
             border-radius: 2px;
+        }}
+        QProgressBar#ChatStatusProgressBar {{
+            height: 2px;
+            min-height: 2px;
+            max-height: 2px;
         }}
         QProgressBar::chunk {{ background-color: {c.accent}; border-radius: 2px; }}
         QCheckBox {{ spacing: 8px; }}
