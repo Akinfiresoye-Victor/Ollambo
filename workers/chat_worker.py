@@ -75,12 +75,18 @@ class ChatWorker(QThread):
             extra_tokens = (estimate_tokens(self._extra_system) + 4) if self._extra_system else 0
             est_tokens = estimate_messages_tokens(self._messages) + extra_tokens
 
+            # ── 0. Strip attachment metadata (must never reach Ollama) ────
+            clean_messages: list[dict[str, str]] = [
+                {k: v for k, v in m.items() if k != "attachments"}
+                for m in self._messages
+            ]
+
             # ── 1. Pre-chat Compaction Check ──────────────────────────────
-            payload_messages = self._messages
+            payload_messages = clean_messages
             threshold_limit = int(num_ctx * 0.75)
             if is_compaction_needed(est_tokens, num_ctx, threshold_ratio=0.75):
                 self.compaction_started.emit(est_tokens, threshold_limit)
-                sys_msgs, to_summarize, recent_msgs = split_for_compaction(self._messages, keep_recent=4)
+                sys_msgs, to_summarize, recent_msgs = split_for_compaction(clean_messages, keep_recent=4)
                 if to_summarize:
                     # Default: instant extractive summary (zero LLM calls). Model summary is opt-in.
                     use_model = bool(self._options.get("use_model_summaries", False)) and not bool(self._options.get("low_power_mode", False))

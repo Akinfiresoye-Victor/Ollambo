@@ -225,6 +225,7 @@ class ChatPage(QWidget):
         self._pending_project_target: dict[str, Any] | None = None
         self._pending_attachments: list[dict[str, str]] = []
         self._last_user_attachments: list[dict[str, str]] = []
+        self._last_extra_system: str = ""
         self._route_worker: RouteWorker | None = None
 
         self._is_hybrid_mode = False
@@ -521,6 +522,7 @@ class ChatPage(QWidget):
         self._pending_project_target = None
         self._pending_attachments = []
         self._last_user_attachments = []
+        self._last_extra_system = ""
         self._render_attachment_chips()
 
         self._clear_history_ui()
@@ -579,6 +581,8 @@ class ChatPage(QWidget):
         self._current_chat_has_ai_title = bool(data.get("ai_title", False))
         self._messages = data.get("messages", [])
         self._last_prompt_eval_tokens = 0
+        self._workspace_id = data.get("workspace_id")
+        self._research_project_id = data.get("research_project_id")
         self._clear_history_ui()
 
         # Lazy-load: only show last 40 messages, add "Load earlier" button if needed
@@ -612,9 +616,39 @@ class ChatPage(QWidget):
             self.tabs.setCurrentIndex(2)
         else:
             self.artifacts_panel.clear()
-            self._build_files = dict(data.get("artifacts", {}))
-            for fname, code in self._build_files.items():
-                self.artifacts_panel.add_file(fname, code)
+            old_artifacts = data.get("artifacts", {})
+
+            if self._workspace_id:
+                # Load files from the workspace on disk
+                self._build_files = workspace.read_all(self._workspace_id)
+                for fname, code in self._build_files.items():
+                    self.artifacts_panel.add_file(fname, code)
+                try:
+                    self.artifacts_panel.load_workspace(self._workspace_id)
+                except Exception:
+                    pass
+            elif old_artifacts:
+                # Migration: old chat stored file contents inline — create a workspace for them
+                plan_goal = ""
+                if saved_plan := data.get("plan"):
+                    plan_goal = saved_plan.get("goal", "")
+                name = plan_goal or data.get("title") or "migrated-project"
+                ws = workspace.create_workspace(name, goal=plan_goal, kind="code", chat_id=chat_id)
+                self._workspace_id = ws.get("id")
+                for fname, code in old_artifacts.items():
+                    try:
+                        workspace.write_file(self._workspace_id, fname, code)
+                    except Exception:
+                        pass
+                self._build_files = dict(old_artifacts)
+                for fname, code in self._build_files.items():
+                    self.artifacts_panel.add_file(fname, code)
+                # Persist the migrated workspace_id and clear old artifacts
+                data["workspace_id"] = self._workspace_id
+                data["artifacts"] = {}
+                save_chat(data)
+            else:
+                self._build_files = {}
 
             if saved_plan := data.get("plan"):
                 self._active_plan = reconstruct_plan(saved_plan)
@@ -647,10 +681,21 @@ class ChatPage(QWidget):
         """Restore a saved work session: show artifacts, mark plan steps, offer resume."""
         plan = reconstruct_plan(session)
         self._active_plan = plan
-        self._build_files = dict(session.get("completed_files", {}))
+        # Prefer workspace files on disk; fall back to session's completed_files
+        ws_id = session.get("workspace_id") or self._workspace_id
+        if ws_id:
+            self._workspace_id = ws_id
+            self._build_files = workspace.read_all(ws_id)
+        else:
+            self._build_files = dict(session.get("completed_files", {}))
         self.artifacts_panel.clear()
         for fname, code in self._build_files.items():
             self.artifacts_panel.add_file(fname, code)
+        if ws_id:
+            try:
+                self.artifacts_panel.load_workspace(ws_id)
+            except Exception:
+                pass
         self.plan_panel.set_plan(plan)
         for s in plan.steps:
             if s.completed:
@@ -764,7 +809,25 @@ class ChatPage(QWidget):
                         widget.deleteLater()
                         break
 
+        # Restore attachments from the retried message so they re-apply
+        if hasattr(self, "_last_user_attachments") and self._last_user_attachments:
+            self._pending_attachments = list(self._last_user_attachments)
+            self._render_attachment_chips()
+
         self._send_message()
+
+    def _build_attachment_context(self, num_ctx: int) -> str:
+        """Build a system-context string from pending attachments, capped at 40% of num_ctx."""
+        if not self._pending_attachments:
+            return ""
+        budget = max(200, int(num_ctx * 0.40))
+        ids = [a["id"] for a in self._pending_attachments]
+        names = " ".join(a.get("name", "") for a in self._pending_attachments)
+        return build_attachment_context(ids, user_prompt=names, budget_tokens=budget)
+
+    def _strip_attachments_from_messages(self, messages: list[dict]) -> list[dict]:
+        """Return a copy of messages with the 'attachments' key removed (never sent to Ollama)."""
+        return [{k: v for k, v in m.items() if k != "attachments"} for m in messages]
 
     # ── Sending & Processing Messages ──────────────────────────────────
 
@@ -777,25 +840,48 @@ class ChatPage(QWidget):
         self.input_edit.clear()
         self._last_user_prompt = text
 
+        # Capture attachments for this message (and restore on retry)
+        attachments = list(self._pending_attachments)
+        self._last_user_attachments = attachments
+        self._pending_attachments = []
+        self._render_attachment_chips()
+
+        # Build attachment context (capped at 40% of num_ctx) for injection into the chat
+        url = self._settings.get("ollama_url", "http://localhost:11434")
+        num_ctx = getattr(self, "_active_num_ctx", int(self._settings.get("num_ctx", 8192)))
+        if attachments:
+            budget = max(200, int(num_ctx * 0.40))
+            ids = [a["id"] for a in attachments]
+            names = " ".join(a.get("name", "") for a in attachments)
+            self._last_extra_system = build_attachment_context(ids, user_prompt=names, budget_tokens=budget)
+        else:
+            self._last_extra_system = ""
+
         # Remove any existing retry button before adding new messages
         self._remove_retry_button()
 
-        self._messages.append({"role": "user", "content": text})
-        self.history_layout.insertWidget(self.history_layout.count() - 1, ChatMessageWidget("user", text))
+        user_msg: dict[str, Any] = {"role": "user", "content": text}
+        if attachments:
+            user_msg["attachments"] = [{"id": a["id"], "name": a["name"]} for a in attachments]
+        self._messages.append(user_msg)
+        att_for_widget = attachments or None
+        self.history_layout.insertWidget(
+            self.history_layout.count() - 1, ChatMessageWidget("user", text, attachments=att_for_widget)
+        )
         self._save_current_conversation()
 
         self.top_bar.set_working()
         self.btn_send.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
-        url = self._settings.get("ollama_url", "http://localhost:11434")
-        num_ctx = getattr(self, "_active_num_ctx", int(self._settings.get("num_ctx", 8192)))
         self._current_assistant_text = []
 
         # AI title is requested after the main reply finishes (see _on_chat_finished / _on_plan_ready)
         # to avoid model reload races when num_ctx differs.
 
         est_tokens = estimate_messages_tokens(self._messages)
+        if self._last_extra_system:
+            est_tokens += estimate_messages_tokens([{"role": "system", "content": self._last_extra_system}])
         if is_compaction_needed(est_tokens, num_ctx, threshold_ratio=0.75):
             self.top_bar.show_status(f"⚡ Checking tokens ({est_tokens:,}/{num_ctx:,}) — compacting history…", 30)
 
@@ -846,20 +932,25 @@ class ChatPage(QWidget):
                 return
             self._dispatch_research(text, url, model, num_ctx)
         else:
-            # Auto mode: try fast heuristic first, only use LLM off-thread if ambiguous
-            heuristic_result = classify_heuristic(text)
-            if heuristic_result:
-                # Heuristic was decisive — dispatch immediately, no freeze
-                self._dispatch_task(heuristic_result, text, url, model, num_ctx)
+            # Auto mode: if a project is attached, decide code vs chat via classify_with_attachment
+            if attachments:
+                att_task = classify_with_attachment(text)
+                self._dispatch_task(att_task, text, url, model, num_ctx)
             else:
-                # Ambiguous — run LLM classifier in background thread (prevents 5-15s freeze)
-                self.top_bar.show_status("🤔 Analyzing task type…")
-                self._current_assistant_widget = ChatMessageWidget("assistant", "")
-                self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
-                cw = self._classify_worker = ClassifyWorker(url, model, text, num_ctx, parent=self)
-                cw.result_ready.connect(lambda task_type: self._on_classify_done(task_type, text, url, model, num_ctx))
-                cw.finished.connect(cw.deleteLater)
-                cw.start()
+                # Auto mode: try fast heuristic first, only use LLM off-thread if ambiguous
+                heuristic_result = classify_heuristic(text)
+                if heuristic_result:
+                    # Heuristic was decisive — dispatch immediately, no freeze
+                    self._dispatch_task(heuristic_result, text, url, model, num_ctx)
+                else:
+                    # Ambiguous — run LLM classifier in background thread (prevents 5-15s freeze)
+                    self.top_bar.show_status("🤔 Analyzing task type…")
+                    self._current_assistant_widget = ChatMessageWidget("assistant", "")
+                    self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
+                    cw = self._classify_worker = ClassifyWorker(url, model, text, num_ctx, parent=self)
+                    cw.result_ready.connect(lambda task_type: self._on_classify_done(task_type, text, url, model, num_ctx))
+                    cw.finished.connect(cw.deleteLater)
+                    cw.start()
 
         self._scroll_to_bottom(force=True)
 
@@ -883,6 +974,36 @@ class ChatPage(QWidget):
         """Launch ResearchWorker to draft research plan or run deep research."""
         depth = self.top_bar.research_depth()
         auto_approve = bool(self._settings.get("auto_approve_research_plans", False))
+
+        # Continue-or-new routing for research projects
+        stage = "auto" if auto_approve else "plan"
+        project_id = None
+        if self._research_project_id:
+            try:
+                from core.research_store import get_project, load_plan
+
+                proj = get_project(self._research_project_id)
+                plan_data = load_plan(self._research_project_id) if proj else None
+                if proj and plan_data:
+                    main_q = plan_data.get("main_question", "")
+                    sub_qs = [sq.get("question", "") for sq in plan_data.get("sub_questions", [])]
+                    rs_summary = {
+                        "name": proj.get("name", ""),
+                        "goal": main_q,
+                        "files": sub_qs,
+                    }
+                    decision = decide_project(question, rs_summary, has_attachment=False)
+                    if decision == "continue":
+                        stage = "continue"
+                        project_id = self._research_project_id
+                        self._add_notice_row(f"🔬 Continuing research on **{proj.get('name', main_q)}**")
+                    else:
+                        # new or ambiguous → start a fresh research project
+                        self._research_project_id = None
+                        self._add_notice_row("🔬 Starting a new research project")
+            except Exception:
+                pass
+
         self.top_bar.show_status(f"🔬 Deep Research ({depth.capitalize()}): drafting research plan…")
 
         self._research_activity_log = [
@@ -916,7 +1037,8 @@ class ChatPage(QWidget):
             url, model, topic=question,
             num_ctx=num_ctx,
             depth=depth,
-            stage="auto" if auto_approve else "plan",
+            project_id=project_id,
+            stage=stage,
             auto_approve=auto_approve,
             settings=self._settings,
             parent=self,
@@ -1185,6 +1307,10 @@ class ChatPage(QWidget):
         self.top_bar.set_idle()
         self.research_panel.refresh()
 
+        # Track this as the chat's active research project for continue-or-new routing
+        self._research_project_id = project_id
+        self._save_current_conversation()
+
         from core.research_store import get_project
         proj = get_project(project_id) or {}
         title = proj.get("title", "Research Report")
@@ -1267,6 +1393,84 @@ class ChatPage(QWidget):
         self._classify_worker = None
         self._dispatch_task(task_type, text, url, model, num_ctx)
 
+    def _get_routing_workspace_summary(self) -> dict | None:
+        """Return the workspace summary for routing: active workspace or first code attachment."""
+        if self._workspace_id:
+            ws = workspace.get_workspace(self._workspace_id)
+            if ws:
+                return ws
+        # Check for an attached code project
+        for att in self._last_user_attachments:
+            if att.get("kind") != "research":
+                ws = workspace.get_workspace(att["id"])
+                if ws:
+                    return ws
+        return None
+
+    def _build_existing_context(self, ws: dict) -> str:
+        """Build a project summary string for the planner from a workspace."""
+        wid = ws.get("id")
+        name = ws.get("name", "")
+        goal = ws.get("goal", "")
+        files = workspace.read_all(wid, max_tokens=2000) if wid else {}
+        sigs = build_project_summary(files)
+        return (
+            f"Project Name: {name}\n"
+            f"Goal: {goal}\n"
+            f"Existing Files:\n{sigs}"
+        )
+
+    def _start_plan_worker(
+        self, task_type: str, text: str, url: str, model: str, num_ctx: int, existing_context: str | None
+    ) -> None:
+        """Launch PlanWorker (used after project routing is resolved)."""
+        if task_type == "code":
+            w = self._active_plan_worker = PlanWorker(url, model, text, num_ctx, existing_context=existing_context, parent=self)
+            w.plan_ready.connect(self._on_plan_ready)
+            w.plan_error.connect(self._on_worker_error)
+            w.finished.connect(w.deleteLater)
+            w.start()
+        else:  # both
+            pw = self._active_plan_worker = PlanWorker(url, model, text, num_ctx, existing_context=existing_context, parent=self)
+            pw.plan_ready.connect(self._on_hybrid_plan_ready)
+            pw.plan_error.connect(lambda err: None)
+            pw.finished.connect(pw.deleteLater)
+            pw.start()
+
+    def _route_and_plan(self, task_type: str, text: str, url: str, model: str, num_ctx: int) -> None:
+        """Run project routing (decide_project + LLM fallback) then start planning."""
+        ws_summary = self._get_routing_workspace_summary()
+        has_attachment = any(a.get("kind") != "research" for a in self._last_user_attachments)
+
+        if not ws_summary:
+            self._pending_project_target = {"mode": "new", "workspace_id": None}
+            self._start_plan_worker(task_type, text, url, model, num_ctx, None)
+            return
+
+        decision = decide_project(text, ws_summary, has_attachment=has_attachment)
+
+        if decision == "ambiguous":
+            # Run LLM routing off the GUI thread
+            self.top_bar.show_status("🤔 Deciding whether to continue or start a new project…")
+            rw = self._route_worker = RouteWorker(url, model, text, ws_summary, num_ctx, parent=self)
+            rw.result_ready.connect(
+                lambda d: self._on_route_resolved(d, task_type, text, url, model, num_ctx, ws_summary)
+            )
+            rw.finished.connect(rw.deleteLater)
+            rw.start()
+        else:
+            self._on_route_resolved(decision, task_type, text, url, model, num_ctx, ws_summary)
+
+    def _on_route_resolved(
+        self, decision: str, task_type: str, text: str, url: str, model: str, num_ctx: int, ws_summary: dict
+    ) -> None:
+        """Apply routing decision and launch the planner."""
+        self._route_worker = None
+        ws_id = ws_summary.get("id")
+        existing_context = self._build_existing_context(ws_summary) if decision == "continue" else None
+        self._pending_project_target = {"mode": decision, "workspace_id": ws_id}
+        self._start_plan_worker(task_type, text, url, model, num_ctx, existing_context)
+
     def _dispatch_task(self, task_type: str, text: str, url: str, model: str, num_ctx: int) -> None:
         """Route the user request to the correct worker based on task type."""
         self._is_hybrid_mode = (task_type == "both")
@@ -1278,13 +1482,10 @@ class ChatPage(QWidget):
                 self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
             else:
                 self._current_assistant_widget.set_content("🧠 Analyzing request & planning project…")
-            w = self._active_plan_worker = PlanWorker(url, model, text, num_ctx, parent=self)
-            w.plan_ready.connect(self._on_plan_ready)
-            w.plan_error.connect(self._on_worker_error)
-            w.finished.connect(w.deleteLater)
-            w.start()
+            self._route_and_plan("code", text, url, model, num_ctx)
         elif task_type == "both":
             is_low_power = bool(self._settings.get("low_power_mode", False))
+            extra_sys = getattr(self, "_last_extra_system", "")
             if is_low_power:
                 self.top_bar.show_status("💬 Replying in chat (low-power: planning will run next)…")
                 if not self._current_assistant_widget:
@@ -1292,7 +1493,7 @@ class ChatPage(QWidget):
                     self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
                 cw = self._active_chat_worker = ChatWorker(
                     url, model, list(self._messages), {"num_ctx": num_ctx, "low_power_mode": True},
-                    self._settings.get("summarizer_model", ""), parent=self,
+                    self._settings.get("summarizer_model", ""), extra_system=extra_sys, parent=self,
                 )
                 cw.token_received.connect(self._on_token_received)
                 cw.compaction_started.connect(self._on_compaction_started)
@@ -1308,7 +1509,7 @@ class ChatPage(QWidget):
                     self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
                 cw = self._active_chat_worker = ChatWorker(
                     url, model, list(self._messages), {"num_ctx": num_ctx},
-                    self._settings.get("summarizer_model", ""), parent=self,
+                    self._settings.get("summarizer_model", ""), extra_system=extra_sys, parent=self,
                 )
                 cw.token_received.connect(self._on_token_received)
                 cw.compaction_started.connect(self._on_compaction_started)
@@ -1318,12 +1519,9 @@ class ChatPage(QWidget):
                 cw.finished.connect(cw.deleteLater)
                 cw.start()
 
-                pw = self._active_plan_worker = PlanWorker(url, model, text, num_ctx, parent=self)
-                pw.plan_ready.connect(self._on_hybrid_plan_ready)
-                pw.plan_error.connect(lambda err: None)
-                pw.finished.connect(pw.deleteLater)
-                pw.start()
+                self._route_and_plan("both", text, url, model, num_ctx)
         else:
+            extra_sys = getattr(self, "_last_extra_system", "")
             if not is_compaction_needed(estimate_messages_tokens(self._messages), num_ctx, threshold_ratio=0.75):
                 self.top_bar.show_status("💬 Connecting to local model…")
             if not self._current_assistant_widget:
@@ -1331,7 +1529,7 @@ class ChatPage(QWidget):
                 self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
             cw = self._active_chat_worker = ChatWorker(
                 url, model, list(self._messages), {"num_ctx": num_ctx},
-                self._settings.get("summarizer_model", ""), parent=self,
+                self._settings.get("summarizer_model", ""), extra_system=extra_sys, parent=self,
             )
             cw.token_received.connect(self._on_token_received)
             cw.compaction_started.connect(self._on_compaction_started)
@@ -1345,11 +1543,7 @@ class ChatPage(QWidget):
         """Run planner sequentially after chat reply finishes in low power mode."""
         self._on_chat_finished(full_chat, meta)
         self.top_bar.show_status("🧠 Low-power mode: planning project…")
-        pw = self._active_plan_worker = PlanWorker(url, model, text, num_ctx, parent=self)
-        pw.plan_ready.connect(self._on_hybrid_plan_ready)
-        pw.plan_error.connect(lambda err: None)
-        pw.finished.connect(pw.deleteLater)
-        pw.start()
+        self._route_and_plan("both", text, url, model, num_ctx)
 
     @Slot(object)
     def _on_hybrid_plan_ready(self, plan: CodingPlan) -> None:
@@ -1412,6 +1606,48 @@ class ChatPage(QWidget):
         self._build_running = True
         self._building_chat_id = self._current_chat_id
         self._building_plan = plan
+
+        # Resolve project target (default to new if no routing happened yet)
+        target = getattr(self, "_pending_project_target", None) or {"mode": "new", "workspace_id": None}
+        mode = target.get("mode", "new")
+        old_workspace_id = self._workspace_id
+
+        if mode == "new":
+            # Save previous workspace if any
+            if old_workspace_id:
+                old_ws = workspace.get_workspace(old_workspace_id)
+                old_name = old_ws.get("name", old_workspace_id) if old_ws else old_workspace_id
+                try:
+                    workspace._update_index_entry(old_workspace_id, status="saved")
+                except Exception:
+                    pass
+                self._add_notice_row(f"💾 Previous build saved as **{old_name}**")
+
+            # Create a fresh workspace
+            name = plan.project_name or workspace.slugify(plan.goal)
+            ws = workspace.create_workspace(name, goal=plan.goal, kind="code", chat_id=self._current_chat_id)
+            self._workspace_id = ws.get("id")
+            if self._workspace_id and self._workspace_id not in self._workspace_ids_history:
+                self._workspace_ids_history.append(self._workspace_id)
+            # Fresh build: start from scratch
+            self._build_files = {}
+            self._active_plan = None
+            self.artifacts_panel.clear()
+            self._add_notice_row(f"🚀 Started a new project **{name}**")
+        else:  # continue
+            ws_id = target.get("workspace_id") or self._workspace_id
+            self._workspace_id = ws_id
+            if ws_id:
+                ws = workspace.get_workspace(ws_id)
+                ws_name = ws.get("name", ws_id) if ws else ws_id
+                # Load existing workspace files into build files for continuation
+                existing_files = workspace.read_all(ws_id) if ws_id else {}
+                self._build_files = dict(existing_files)
+                self.artifacts_panel.clear()
+                for fn, content in existing_files.items():
+                    self.artifacts_panel.add_file(fn, content)
+                self._add_notice_row(f"📂 Continuing in project **{ws_name}**")
+
         self._building_files = dict(self._build_files)
 
         self.plan_panel.btn_approve.setText("Building in Progress…")
@@ -1419,7 +1655,9 @@ class ChatPage(QWidget):
         self.tabs.setCurrentIndex(2)
         self.btn_stop.setEnabled(True)
 
-        start = get_resume_step(plan) if self._building_files else 1
+        # Resume step: only when the SAME plan already has completed steps
+        same_plan_has_completed = bool(self._active_plan and self._active_plan is plan and any(s.completed for s in plan.steps))
+        start = get_resume_step(plan) if same_plan_has_completed else 1
         existing = dict(self._building_files)
         total = len(plan.steps)
         label = plan.steps[start - 1].file if start <= total else "?"
@@ -1427,7 +1665,7 @@ class ChatPage(QWidget):
         self.top_bar.show_status(f"⚙️ {action} [{start}/{total}] {label}…", 0)
 
         self.sidebar.show_wip(self._building_chat_id)
-        save_session(self._building_chat_id, plan, self._building_files, start)
+        save_session(self._building_chat_id, plan, self._building_files, start, workspace_id=self._workspace_id)
         self._save_current_conversation()
 
         is_lp = bool(self._settings.get("low_power_mode", False))
@@ -1445,6 +1683,7 @@ class ChatPage(QWidget):
             start_step=start,
             existing_files=existing,
             low_power=is_lp,
+            workspace_id=self._workspace_id,
             parent=self,
         )
         w.step_started.connect(lambda s, f: self._on_step_started(s, f, total))
@@ -1480,28 +1719,15 @@ class ChatPage(QWidget):
         target_id = self._building_chat_id or self._current_chat_id
         self._building_files[filename] = code
 
-        # Always persist session and chat file on disk for the building chat
+        # Persist session (plan state + next step + workspace_id) - NO full chat reload per file
         if self._building_plan:
             for s in self._building_plan.steps:
                 if s.step == step_num or s.file == filename:
                     s.completed = True
-            save_session(target_id, self._building_plan, self._building_files, step_num + 1)
-
-        c_data = load_chat(target_id)
-        if c_data:
-            c_data["artifacts"] = dict(self._building_files)
-            if self._building_plan:
-                c_data["plan"] = {
-                    "goal": self._building_plan.goal,
-                    "assumptions": self._building_plan.assumptions,
-                    "files": self._building_plan.files,
-                    "steps": [
-                        {"step": s.step, "description": s.description, "file": s.file, "completed": s.completed}
-                        for s in self._building_plan.steps
-                    ],
-                    "raw_text": self._building_plan.raw_text,
-                }
-            save_chat(c_data)
+            save_session(
+                target_id, self._building_plan, self._building_files, step_num + 1,
+                workspace_id=self._workspace_id,
+            )
 
         # Update UI if user is actively viewing the building chat
         if self._current_chat_id == target_id:
@@ -1521,19 +1747,28 @@ class ChatPage(QWidget):
         complete_session(target_id)
         self.sidebar.hide_wip()
 
-        # Generate detailed project summary and step-by-step walkthrough on how to run it
-        summary = generate_project_walkthrough(self._building_plan or self._active_plan, files)
+        # Prefer files from the workspace on disk (source of truth)
+        ws_files = workspace.read_all(self._workspace_id) if self._workspace_id else files
+        summary = generate_project_walkthrough(self._building_plan or self._active_plan, ws_files)
+
+        # Include project folder path in the summary
+        if self._workspace_id:
+            wp = workspace.workspace_path(self._workspace_id)
+            if wp:
+                summary = f"{summary}\n\n📁 **Project folder:** `{wp}`"
 
         c_data = load_chat(target_id)
         if c_data:
             c_data.setdefault("messages", []).append({"role": "assistant", "content": summary})
-            c_data["artifacts"] = dict(files)
+            # Stop storing file contents in chat JSON; store workspace_id instead
+            c_data["artifacts"] = {}
+            c_data["workspace_id"] = self._workspace_id
             save_chat(c_data)
 
         if self._current_chat_id == target_id:
             self._messages.append({"role": "assistant", "content": summary})
             self.history_layout.insertWidget(self.history_layout.count() - 1, ChatMessageWidget("assistant", summary))
-            self.top_bar.show_status(f"✅ All {len(files)} files completed! Walkthrough generated.", 100)
+            self.top_bar.show_status(f"✅ All {len(ws_files)} files completed! Walkthrough generated.", 100)
             QTimer.singleShot(4000, self.top_bar.hide_status)
             self.plan_panel.btn_approve.setText("✅ Build Completed")
             self.plan_panel.btn_approve.setEnabled(False)
@@ -1603,6 +1838,18 @@ class ChatPage(QWidget):
             f"⚡ Compacting conversation ({current_tok:,} tokens exceeded 75% limit)…",
             40,
         )
+
+    def _add_notice_row(self, markdown_text: str) -> None:
+        """Insert a small notice row into the chat history (not saved to messages)."""
+        try:
+            from ui.message_widget import ChatMessageWidget
+
+            notice = ChatMessageWidget("assistant", markdown_text)
+            self.history_layout.insertWidget(self.history_layout.count() - 1, notice)
+        except Exception:
+            notice = QLabel(markdown_text)
+            notice.setStyleSheet("color: #abb2bf; font-size: 11px; font-style: italic; padding: 2px 0;")
+            self.history_layout.insertWidget(self.history_layout.count() - 1, notice)
 
     @Slot(list, int, int)
     def _on_compaction_performed(self, new_messages: list, old_tok: int, new_tok: int) -> None:
@@ -1729,15 +1976,26 @@ class ChatPage(QWidget):
             "title": title,
             "ai_title": self._current_chat_has_ai_title,
             "messages": self._messages,
-            "artifacts": dict(self._build_files),
+            "workspace_id": self._workspace_id,
+            "research_project_id": self._research_project_id,
         }
+        # Stop storing file contents in chat JSON for builds that have a workspace
+        if not self._workspace_id:
+            chat_data["artifacts"] = dict(self._build_files)
         if self._active_plan:
             chat_data["plan"] = {
                 "goal": self._active_plan.goal,
                 "assumptions": self._active_plan.assumptions,
                 "files": self._active_plan.files,
+                "project_name": getattr(self._active_plan, "project_name", ""),
                 "steps": [
-                    {"step": s.step, "description": s.description, "file": s.file, "completed": s.completed}
+                    {
+                        "step": s.step,
+                        "description": s.description,
+                        "file": s.file,
+                        "completed": s.completed,
+                        "action": getattr(s, "action", "create"),
+                    }
                     for s in self._active_plan.steps
                 ],
                 "raw_text": self._active_plan.raw_text,
