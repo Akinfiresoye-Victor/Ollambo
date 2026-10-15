@@ -24,16 +24,15 @@ from PySide6.QtWidgets import (
 
 from core.installer import InstallPlan, get_install_plan
 from core.setup_checker import SUGGESTED_MODELS, check_hardware_capabilities
+from ui.icons import icon
+from ui.text_utils import strip_emoji_prefix
 from ui.terminal_widget import TerminalWidget
+from ui.theme.tokens import DARK
+from ui.widgets.toast import show_toast
+from ui.worker_guard import request_stop, wait_briefly, worker_is_running
 from workers.install_worker import InstallWorker
 from workers.pull_worker import PullWorker
 from workers.setup_worker import SetupWorker
-
-# Status icons (plain text — no emoji issues on older terminals).
-_CHECKING = "⏳"
-_OK = "✅"
-_FAIL = "❌"
-
 
 class SetupWizard(QWidget):
     """Step-by-step setup checks with install/pull support."""
@@ -70,9 +69,9 @@ class SetupWizard(QWidget):
         t_box = QVBoxLayout()
         t_box.setSpacing(2)
         title = QLabel("Setting up Ollambo")
-        title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        title.setProperty("role", "title")
         subtitle = QLabel("Checking your system…")
-        subtitle.setStyleSheet("color: #888;")
+        subtitle.setProperty("role", "muted")
         t_box.addWidget(title)
         t_box.addWidget(subtitle)
         hdr.addLayout(t_box)
@@ -80,12 +79,27 @@ class SetupWizard(QWidget):
         layout.addLayout(hdr)
 
         # ── Check status lines ────────────────────────────────────────
-        self._lbl_installed = QLabel(f"{_CHECKING} Ollama installed — checking…")
-        self._lbl_server = QLabel(f"{_CHECKING} Ollama server — waiting…")
-        self._lbl_models = QLabel(f"{_CHECKING} Models available — waiting…")
-        for lbl in (self._lbl_installed, self._lbl_server, self._lbl_models):
-            lbl.setStyleSheet("font-size: 14px; padding: 2px 0;")
-            layout.addWidget(lbl)
+        self._check_icons: dict[str, QLabel] = {}
+        self._check_labels = {
+            "installed": QLabel("Ollama installed — checking…"),
+            "server": QLabel("Ollama server — waiting…"),
+            "models": QLabel("Models available — waiting…"),
+        }
+        self._check_states: dict[str, str] = {}
+        for name, lbl in self._check_labels.items():
+            row = QHBoxLayout()
+            icon_label = QLabel()
+            icon_label.setFixedSize(18, 18)
+            row.addWidget(icon_label)
+            lbl.setProperty("role", "body")
+            row.addWidget(lbl)
+            row.addStretch()
+            layout.addLayout(row)
+            self._check_icons[name] = icon_label
+            self._set_check_status(name, "checking", lbl.text())
+        self._lbl_installed = self._check_labels["installed"]
+        self._lbl_server = self._check_labels["server"]
+        self._lbl_models = self._check_labels["models"]
 
         # ── Install section (hidden by default) ───────────────────────
         self._install_section = QWidget()
@@ -95,7 +109,6 @@ class SetupWizard(QWidget):
         self._manual_steps = QTextEdit()
         self._manual_steps.setReadOnly(True)
         self._manual_steps.setMaximumHeight(120)
-        self._manual_steps.setStyleSheet("background: #2a2a2a; color: #ccc; border: 1px solid #444; padding: 6px;")
         install_layout.addWidget(self._manual_steps)
 
         self._btn_install = QPushButton("Install Ollama for me")
@@ -129,13 +142,17 @@ class SetupWizard(QWidget):
             if rec_idx >= 0:
                 self._model_combo.setCurrentIndex(rec_idx)
             hw_label = QLabel(
-                f"💡 System check: {hw['total_ram_gb']} GB RAM detected (≤8 GB).\n"
+                f"System check: {hw['total_ram_gb']} GB RAM detected (≤8 GB).\n"
                 f"Suggested: Low-Power Mode and lightweight model '{hw['recommended_model']}'."
             )
-            hw_label.setStyleSheet("color: #e5c07b; font-size: 11px; padding: 4px; background: #2c2820; border-radius: 4px;")
+            hw_label.setProperty("role", "warning")
+            hw_icon = QLabel()
+            hw_icon.setPixmap(icon("cpu", size=16).pixmap(16, 16))
+            model_layout.addWidget(hw_icon)
             model_layout.addWidget(hw_label)
 
         self._low_power_check = QCheckBox("Enable Low-Power Mode (optimizes CPU, RAM & VRAM)")
+        self._low_power_check.setIcon(icon("cpu"))
         self._low_power_check.setChecked(hw["suggest_low_power"])
         model_layout.addWidget(self._low_power_check)
 
@@ -170,17 +187,17 @@ class SetupWizard(QWidget):
     def run_checks(self) -> None:
         """Start (or restart) the setup checks."""
         # Reset UI.
-        self._lbl_installed.setText(f"{_CHECKING} Ollama installed — checking…")
-        self._lbl_server.setText(f"{_CHECKING} Ollama server — waiting…")
-        self._lbl_models.setText(f"{_CHECKING} Models available — waiting…")
+        self._set_check_status("installed", "checking", "Ollama installed — checking…")
+        self._set_check_status("server", "checking", "Ollama server — waiting…")
+        self._set_check_status("models", "checking", "Models available — waiting…")
         self._install_section.setVisible(False)
         self._model_section.setVisible(False)
         self._btn_continue.setEnabled(False)
 
         # Stop any running worker.
-        if self._setup_worker and self._setup_worker.isRunning():
-            self._setup_worker.stop()
-            self._setup_worker.wait(2000)
+        if worker_is_running(self._setup_worker):
+            request_stop(self._setup_worker)
+            wait_briefly(self._setup_worker, 2000)
 
         self._setup_worker = SetupWorker(self._ollama_url, parent=self)
         self._setup_worker.check_result.connect(self._on_check_result)
@@ -191,15 +208,22 @@ class SetupWizard(QWidget):
 
     @Slot(str, bool, str)
     def _on_check_result(self, name: str, ok: bool, detail: str) -> None:
-        icon = _OK if ok else _FAIL
-        labels = {
-            "installed": self._lbl_installed,
-            "server": self._lbl_server,
-            "models": self._lbl_models,
-        }
-        lbl = labels.get(name)
-        if lbl:
-            lbl.setText(f"{icon} {name.replace('_', ' ').title()} — {detail}")
+        if name in self._check_labels:
+            state = "ok" if ok else "failed"
+            clean_detail, _ = strip_emoji_prefix(detail)
+            self._set_check_status(name, state, f"{name.replace('_', ' ').title()} — {clean_detail}")
+
+    def _set_check_status(self, name: str, state: str, text: str) -> None:
+        label = self._check_labels.get(name)
+        icon_label = self._check_icons.get(name)
+        if label is None or icon_label is None:
+            return
+        self._check_states[name] = state
+        clean_text, _ = strip_emoji_prefix(text)
+        label.setText(clean_text)
+        icon_name = {"checking": "loader", "ok": "check", "failed": "alert-triangle"}[state]
+        color = DARK.colors.accent if state == "ok" else DARK.colors.text_secondary
+        icon_label.setPixmap(icon(icon_name, color, 16).pixmap(16, 16))
 
     @Slot(bool, list, bool)
     def _on_all_done(self, all_ok: bool, models: list[str], server_started: bool) -> None:
@@ -215,9 +239,9 @@ class SetupWizard(QWidget):
                 self._on_continue()
         else:
             # Figure out what failed and show the right action section.
-            if _FAIL in self._lbl_installed.text():
+            if self._check_states.get("installed") == "failed":
                 self._show_install_section()
-            elif _FAIL in self._lbl_models.text():
+            elif self._check_states.get("models") == "failed":
                 self._model_section.setVisible(True)
 
     # ── Install flow ──────────────────────────────────────────────────
@@ -265,6 +289,7 @@ class SetupWizard(QWidget):
         self._btn_install.setEnabled(True)
         self._terminal.append_text(f"\n{message}\n")
         if success:
+            show_toast(self, "Ollama installed successfully")
             # Re-run checks to verify install worked.
             self.run_checks()
 
@@ -290,14 +315,17 @@ class SetupWizard(QWidget):
         if total > 0:
             pct = int(completed * 100 / total)
             self._pull_progress.setValue(pct)
-        self._pull_status.setText(status)
+        clean_status, _ = strip_emoji_prefix(status)
+        self._pull_status.setText(clean_status)
 
     @Slot(bool, str)
     def _on_pull_finished(self, success: bool, message: str) -> None:
         self._btn_pull.setEnabled(True)
-        self._pull_status.setText(message)
+        clean_message, _ = strip_emoji_prefix(message)
+        self._pull_status.setText(clean_message)
         self._pull_progress.setVisible(False)
         if success:
+            show_toast(self, f"Model ready: {self._model_combo.currentText()}")
             # Re-run checks — this time models should be found.
             self.run_checks()
 
@@ -317,6 +345,6 @@ class SetupWizard(QWidget):
     def stop_workers(self) -> None:
         """Stop all running workers (called on app exit)."""
         for w in (self._setup_worker, self._install_worker, self._pull_worker):
-            if w and w.isRunning():
-                w.stop()
-                w.wait(2000)
+            if worker_is_running(w):
+                request_stop(w)
+                wait_briefly(w, 2000)

@@ -8,7 +8,7 @@ Call append_text(str) from any thread via its signal — it is thread-safe.
 from __future__ import annotations
 
 from PySide6.QtCore import Signal, Slot
-from PySide6.QtGui import QFont, QTextCursor
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QPlainTextEdit
 
 
@@ -21,19 +21,9 @@ class TerminalWidget(QPlainTextEdit):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setReadOnly(True)
-        self.setFont(QFont("Consolas", 10))
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.setMaximumBlockCount(5000)  # Prevent unbounded memory use.
-
-        # Style: dark background, light text.
-        self.setStyleSheet(
-            "QPlainTextEdit {"
-            "  background-color: #1e1e1e;"
-            "  color: #cccccc;"
-            "  border: 1px solid #333;"
-            "  padding: 4px;"
-            "}"
-        )
+        self.setProperty("role", "code")
 
         # Connect the signal so appending from any thread is safe.
         self.append_requested.connect(self._do_append)

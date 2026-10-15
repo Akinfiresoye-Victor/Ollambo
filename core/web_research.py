@@ -118,6 +118,16 @@ def normalize_url(text: str) -> str:
     return f"https://{s}"
 
 
+# Bare tokens like "main.py" match the domain regex because the last label is
+# alphabetic. Reject those unless the match already had http(s)://.
+_BARE_FILE_EXTS = frozenset({
+    "py", "js", "ts", "tsx", "jsx", "md", "json", "txt", "html", "css",
+    "yml", "yaml", "toml", "ini", "cfg", "csv", "sh", "bat", "ps1",
+    "java", "c", "cpp", "h", "go", "rs", "rb", "php", "sql", "log",
+    "lock", "xml", "zip",
+})
+
+
 def extract_urls(text: str) -> list[str]:
     """Extract and normalize all full URLs and bare domains from text.
     Returns list of normalized https URLs in order with duplicates removed.
@@ -134,12 +144,15 @@ def extract_urls(text: str) -> list[str]:
         m_clean = re.sub(r"[\.,;:!?)]+$", "", m).strip()
         if not m_clean:
             continue
+        has_scheme = m_clean.lower().startswith("http://") or m_clean.lower().startswith("https://")
         parsed = urlparse(m_clean if "://" in m_clean else f"http://{m_clean}")
         hostname = parsed.hostname or ""
         if "." not in hostname:
             continue
         tld = hostname.split(".")[-1]
         if not tld.isalpha() or len(tld) < 2:
+            continue
+        if not has_scheme and tld.lower() in _BARE_FILE_EXTS:
             continue
         norm = normalize_url(m_clean)
         if norm not in seen:

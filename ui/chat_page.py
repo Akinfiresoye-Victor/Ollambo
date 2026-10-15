@@ -6,12 +6,13 @@ Background Builds with Persistent Sessions, and Keep-Alive Model Connection.
 
 from __future__ import annotations
 
-import threading
+from functools import partial
 import time
 import uuid
 from typing import Any
 
-from PySide6.QtCore import QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QPropertyAnimation, QTimer, Qt, Signal, Slot
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -20,7 +21,6 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSplitter,
     QStackedWidget,
-    QTabWidget,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
@@ -29,30 +29,45 @@ from PySide6.QtWidgets import (
 
 import core.workspace as workspace
 from core.code_writer import build_project_summary
-from core.project_router import classify_with_attachment, decide_project, route_with_llm
+from core.project_router import classify_with_attachment, decide_project
 from core.workspace_context import build_attachment_context
 from core.build_session import complete_session, get_resume_step, load_session, reconstruct_plan, save_session
 from core.context_manager import estimate_messages_tokens, is_compaction_needed
-from core.ollama_client import OllamaClient
 from core.planner import CodingPlan
 from core.storage import (
     get_effective_keep_alive,
     get_effective_keep_alive_seconds,
-    list_active_sessions,
     load_chat,
     resolve_num_ctx,
     save_chat,
 )
-from core.task_classifier import classify_task, classify_heuristic
+from core.task_classifier import classify_heuristic
 from core.walkthrough import generate_project_walkthrough
+from core.chat_session import ChatSession
 from ui.artifacts_panel import ArtifactsPanel
+from ui.background_workers import (
+    ClassifyWorker,
+    ContextLengthWorker,
+    PreloadWorker,
+    RouteWorker,
+    UnloadWorker,
+)
 from ui.chat_sidebar import ChatSidebar
 from ui.chat_top_bar import ChatTopBar
+from ui.chat_view import ChatView
+from ui.icons import icon
 from ui.message_widget import ChatMessageWidget
+from ui.navigation import Navigator
 from ui.plan_panel import PlanPanel
 from ui.research_panel import ResearchPanel
 from ui.research_plan_panel import ResearchPlanPanel
+from ui.session_controller import SessionController
 from ui.settings_dialog import SettingsDialog
+from ui.theme import set_property, set_variant
+from ui.theme.tokens import DARK
+from ui.text_utils import strip_emoji_prefix
+from ui.widgets.composer import Composer
+from ui.worker_guard import request_stop, wait_briefly, worker_is_running
 from core.web_research import extract_urls
 from workers.chat_worker import ChatWorker
 from workers.code_worker import CodeWorker
@@ -62,75 +77,7 @@ from workers.research_worker import ResearchWorker
 from workers.web_answer_worker import WebAnswerWorker
 from workers.title_worker import TitleWorker
 
-
-class ContextLengthWorker(QThread):
-    """Fetch model context length off the GUI thread to prevent freezing."""
-
-    result_ready = Signal(int)
-
-    def __init__(self, ollama_url: str, model: str, parent=None) -> None:
-        super().__init__(parent)
-        self._url = ollama_url
-        self._model = model
-
-    def run(self) -> None:
-        client = OllamaClient(self._url)
-        ctx = client.get_context_length(self._model)
-        client.close()
-        self.result_ready.emit(ctx)
-
-
-class ClassifyWorker(QThread):
-    """Run LLM-based task classification off the GUI thread to prevent freezing."""
-
-    result_ready = Signal(str)  # Emits 'chat', 'code', or 'both'
-
-    def __init__(self, ollama_url: str, model: str, prompt: str, num_ctx: int = 8192, parent=None) -> None:
-        super().__init__(parent)
-        self._url = ollama_url
-        self._model = model
-        self._prompt = prompt
-        self._num_ctx = num_ctx
-
-    def run(self) -> None:
-        client = OllamaClient(self._url)
-        try:
-            result = classify_task(self._prompt, self._url, self._model, num_ctx=self._num_ctx, client=client)
-            self.result_ready.emit(result)
-        finally:
-            client.close()
-
-
-class RouteWorker(QThread):
-    """Run LLM-based project routing off the GUI thread when heuristic is ambiguous."""
-
-    result_ready = Signal(str)  # Emits 'continue' or 'new'
-
-    def __init__(
-        self,
-        ollama_url: str,
-        model: str,
-        prompt: str,
-        workspace_summary: dict | None,
-        num_ctx: int = 8192,
-        parent=None,
-    ) -> None:
-        super().__init__(parent)
-        self._url = ollama_url
-        self._model = model
-        self._prompt = prompt
-        self._ws_summary = workspace_summary
-        self._num_ctx = num_ctx
-
-    def run(self) -> None:
-        decision = route_with_llm(
-            self._url,
-            self._model,
-            self._prompt,
-            self._ws_summary,
-            num_ctx=self._num_ctx,
-        )
-        self.result_ready.emit(decision)
+_MAX_LIVE_VIEWS = 6
 
 
 class ChatInputEdit(QTextEdit):
@@ -149,38 +96,6 @@ class ChatInputEdit(QTextEdit):
         super().keyPressEvent(event)
 
 
-class PreloadWorker(QThread):
-    """Background thread to preload/warm a model into RAM/VRAM without freezing UI."""
-
-    finished_preload = Signal(str, bool)
-
-    def __init__(self, ollama_url: str, model: str, keep_alive: str = "3m", parent=None) -> None:
-        super().__init__(parent)
-        self._url = ollama_url
-        self._model = model
-        self._keep_alive = keep_alive
-
-    def run(self) -> None:
-        client = OllamaClient(self._url)
-        ok = client.preload_model(self._model, keep_alive=self._keep_alive)
-        client.close()
-        self.finished_preload.emit(self._model, ok)
-
-
-class UnloadWorker(QThread):
-    """Background thread to unload model when keep-alive window expires."""
-
-    def __init__(self, ollama_url: str, model: str, parent=None) -> None:
-        super().__init__(parent)
-        self._url = ollama_url
-        self._model = model
-
-    def run(self) -> None:
-        client = OllamaClient(self._url)
-        client.unload_model(self._model)
-        client.close()
-
-
 class ChatPage(QWidget):
     """Full interactive chat interface connected to local Ollama."""
 
@@ -189,84 +104,314 @@ class ChatPage(QWidget):
         self._settings = settings
         self._models: list[str] = []
         self._current_chat_id = str(uuid.uuid4())
-        self._current_chat_title: str | None = None
-        self._current_chat_has_ai_title: bool = False
+        self._controllers: dict[str, SessionController] = {}
+        self._view_last_used: dict[str, float] = {}
+        self._deleted_chat_ids: set[str] = set()
         self._active_title_workers: list[TitleWorker] = []
-        self._messages: list[dict] = []
-        self._last_prompt_eval_tokens = 0
 
-        self._active_chat_worker: ChatWorker | None = None
-        self._active_plan_worker: PlanWorker | None = None
         self._active_code_worker: CodeWorker | None = None
-        self._active_research_worker: ResearchWorker | None = None
         self._preload_worker: PreloadWorker | None = None
-        self._classify_worker: ClassifyWorker | None = None
-
-        self._current_assistant_widget: ChatMessageWidget | None = None
-        self._current_assistant_text: list[str] = []
-
-        # Track the last user prompt for retry functionality
-        self._last_user_prompt: str = ""
-
-        # Current chat's plan and files
-        self._active_plan: CodingPlan | None = None
-        self._build_files: dict[str, str] = {}
 
         # Background build tracking (decoupled from active chat view)
         self._build_running = False
         self._building_chat_id: str | None = None
         self._building_plan: CodingPlan | None = None
         self._building_files: dict[str, str] = {}
+        self._building_workspace_id: str | None = None
 
-        # Workspace and Project State
-        self._workspace_id: str | None = None
-        self._workspace_ids_history: list[str] = []
-        self._research_project_id: str | None = None
-        self._pending_project_target: dict[str, Any] | None = None
-        self._pending_attachments: list[dict[str, str]] = []
-        self._last_user_attachments: list[dict[str, str]] = []
-        self._last_extra_system: str = ""
-        self._route_worker: RouteWorker | None = None
-
-        self._is_hybrid_mode = False
-
-        # Smooth ~100ms streaming UI flush timer to minimize CPU/VRAM load
         self._stream_flush_timer = QTimer(self)
         self._stream_flush_timer.setInterval(100)
         self._stream_flush_timer.timeout.connect(self._flush_stream_ui)
         self._pending_stream_dirty = False
-
         self._user_scrolled_away = False
-
-        # Debounced scroll-to-bottom to avoid excessive layout recalculations
         self._scroll_timer = QTimer(self)
         self._scroll_timer.setSingleShot(True)
         self._scroll_timer.setInterval(50)
         self._scroll_timer.timeout.connect(self._do_scroll_to_bottom)
 
         self._build_ui()
+        self._draft_save_timer = QTimer(self)
+        self._draft_save_timer.setInterval(3000)
+        self._draft_save_timer.timeout.connect(self._save_streaming_drafts)
+        self._draft_save_timer.start()
         self._auto_timer = QTimer(self)
         self._auto_timer.timeout.connect(self._refresh_models)
         self._auto_timer.start(25000)
 
+    @property
+    def _active_controller(self) -> SessionController:
+        return self._controllers[self._current_chat_id]
+
+    @property
+    def _messages(self) -> list[dict[str, Any]]:
+        return self._active_controller.session.messages
+
+    @property
+    def _current_assistant_widget(self) -> ChatMessageWidget | None:
+        view = self._active_controller.view
+        return view.streaming_widget if view is not None else None
+
+    @_current_assistant_widget.setter
+    def _current_assistant_widget(self, widget: ChatMessageWidget | None) -> None:
+        view = self._active_controller.view
+        if view is not None:
+            view.streaming_widget = widget
+
+    @property
+    def _current_assistant_text(self) -> list[str]:
+        return self._active_controller.session.streaming
+
+    @_current_assistant_text.setter
+    def _current_assistant_text(self, text: list[str]) -> None:
+        self._active_controller.session.streaming = text
+
+    @property
+    def _last_user_prompt(self) -> str:
+        return self._active_controller.session.last_user_prompt
+
+    @_last_user_prompt.setter
+    def _last_user_prompt(self, value: str) -> None:
+        self._active_controller.session.last_user_prompt = value
+
+    @property
+    def _last_user_attachments(self) -> list[dict[str, Any]]:
+        return self._active_controller.session.last_user_attachments
+
+    @_last_user_attachments.setter
+    def _last_user_attachments(self, value: list[dict[str, Any]]) -> None:
+        self._active_controller.session.last_user_attachments = value
+
+    @property
+    def _last_extra_system(self) -> str:
+        return self._active_controller.session.last_extra_system
+
+    @_last_extra_system.setter
+    def _last_extra_system(self, value: str) -> None:
+        self._active_controller.session.last_extra_system = value
+
+    @property
+    def _workspace_id(self) -> str | None:
+        return self._active_controller.session.workspace_id
+
+    @_workspace_id.setter
+    def _workspace_id(self, value: str | None) -> None:
+        self._active_controller.session.workspace_id = value
+
+    @property
+    def _workspace_ids_history(self) -> list[str]:
+        return self._active_controller.session.workspace_ids_history
+
+    @_workspace_ids_history.setter
+    def _workspace_ids_history(self, value: list[str]) -> None:
+        self._active_controller.session.workspace_ids_history = value
+
+    @property
+    def _research_project_id(self) -> str | None:
+        return self._active_controller.session.research_project_id
+
+    @_research_project_id.setter
+    def _research_project_id(self, value: str | None) -> None:
+        self._active_controller.session.research_project_id = value
+
+    @property
+    def _pending_project_target(self) -> dict[str, Any] | None:
+        return self._active_controller.session.pending_project_target
+
+    @_pending_project_target.setter
+    def _pending_project_target(self, value: dict[str, Any] | None) -> None:
+        self._active_controller.session.pending_project_target = value
+
+    @property
+    def _pending_attachments(self) -> list[dict[str, Any]]:
+        return self._active_controller.session.pending_attachments
+
+    @_pending_attachments.setter
+    def _pending_attachments(self, value: list[dict[str, Any]]) -> None:
+        self._active_controller.session.pending_attachments = value
+
+    @property
+    def _build_files(self) -> dict[str, str]:
+        return self._active_controller.session.build_files
+
+    @_build_files.setter
+    def _build_files(self, value: dict[str, str]) -> None:
+        self._active_controller.session.build_files = value
+
+    @property
+    def _last_prompt_eval_tokens(self) -> int:
+        return self._active_controller.session.last_prompt_eval_tokens
+
+    @_last_prompt_eval_tokens.setter
+    def _last_prompt_eval_tokens(self, value: int) -> None:
+        self._active_controller.session.last_prompt_eval_tokens = value
+
+    @property
+    def _is_hybrid_mode(self) -> bool:
+        return self._active_controller.session.is_hybrid_mode
+
+    @_is_hybrid_mode.setter
+    def _is_hybrid_mode(self, value: bool) -> None:
+        self._active_controller.session.is_hybrid_mode = value
+
+    @property
+    def _current_chat_title(self) -> str | None:
+        return self._active_controller.session.title
+
+    @_current_chat_title.setter
+    def _current_chat_title(self, value: str | None) -> None:
+        self._active_controller.session.title = value
+
+    @property
+    def _current_chat_has_ai_title(self) -> bool:
+        return self._active_controller.session.ai_title
+
+    @_current_chat_has_ai_title.setter
+    def _current_chat_has_ai_title(self, value: bool) -> None:
+        self._active_controller.session.ai_title = value
+
+    @property
+    def _pending_research_topic(self) -> str:
+        return self._active_controller.session.pending_research_topic
+
+    @_pending_research_topic.setter
+    def _pending_research_topic(self, value: str) -> None:
+        self._active_controller.session.pending_research_topic = value
+
+    @property
+    def _pending_research_url(self) -> str:
+        return self._active_controller.session.pending_research_url
+
+    @_pending_research_url.setter
+    def _pending_research_url(self, value: str) -> None:
+        self._active_controller.session.pending_research_url = value
+
+    @property
+    def _pending_research_model(self) -> str:
+        return self._active_controller.session.pending_research_model
+
+    @_pending_research_model.setter
+    def _pending_research_model(self, value: str) -> None:
+        self._active_controller.session.pending_research_model = value
+
+    @property
+    def _pending_research_num_ctx(self) -> int:
+        return self._active_controller.session.pending_research_num_ctx
+
+    @_pending_research_num_ctx.setter
+    def _pending_research_num_ctx(self, value: int) -> None:
+        self._active_controller.session.pending_research_num_ctx = value
+
+    @property
+    def _pending_research_plan(self) -> Any:
+        return self._active_controller.session.pending_research_plan
+
+    @_pending_research_plan.setter
+    def _pending_research_plan(self, value: Any) -> None:
+        self._active_controller.session.pending_research_plan = value
+
+    @property
+    def _pending_research_project_id(self) -> str | None:
+        return self._active_controller.session.pending_research_project_id
+
+    @_pending_research_project_id.setter
+    def _pending_research_project_id(self, value: str | None) -> None:
+        self._active_controller.session.pending_research_project_id = value
+
+    @property
+    def _research_activity_log(self) -> list[str]:
+        return self._active_controller.session.research_activity_log
+
+    @_research_activity_log.setter
+    def _research_activity_log(self, value: list[str]) -> None:
+        self._active_controller.session.research_activity_log = value
+
+    @property
+    def _last_research_progress_time(self) -> float:
+        return self._active_controller.session.last_research_progress_time
+
+    @_last_research_progress_time.setter
+    def _last_research_progress_time(self, value: float) -> None:
+        self._active_controller.session.last_research_progress_time = value
+
+    @property
+    def _research_start_mono(self) -> float:
+        return self._active_controller.session.research_start_mono
+
+    @_research_start_mono.setter
+    def _research_start_mono(self, value: float) -> None:
+        self._active_controller.session.research_start_mono = value
+
+    @property
+    def _active_plan(self) -> CodingPlan | None:
+        return self._active_controller.coding_plan
+
+    @_active_plan.setter
+    def _active_plan(self, value: CodingPlan | None) -> None:
+        self._active_controller.coding_plan = value
+
+    @property
+    def _active_chat_worker(self) -> Any:
+        return self._active_controller.chat_worker
+
+    @_active_chat_worker.setter
+    def _active_chat_worker(self, worker: Any) -> None:
+        self._active_controller.chat_worker = worker
+
+    @property
+    def _active_plan_worker(self) -> Any:
+        return self._active_controller.plan_worker
+
+    @_active_plan_worker.setter
+    def _active_plan_worker(self, worker: Any) -> None:
+        self._active_controller.plan_worker = worker
+
+    @property
+    def _active_research_worker(self) -> Any:
+        return self._active_controller.research_worker
+
+    @_active_research_worker.setter
+    def _active_research_worker(self, worker: Any) -> None:
+        self._active_controller.research_worker = worker
+
+    @property
+    def _classify_worker(self) -> Any:
+        return self._active_controller.classify_worker
+
+    @_classify_worker.setter
+    def _classify_worker(self, worker: Any) -> None:
+        self._active_controller.classify_worker = worker
+
+    @property
+    def _route_worker(self) -> Any:
+        return self._active_controller.route_worker
+
+    @_route_worker.setter
+    def _route_worker(self, worker: Any) -> None:
+        self._active_controller.route_worker = worker
+
     def _build_ui(self) -> None:
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(splitter)
+        self.shell_splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_layout.addWidget(self.shell_splitter)
 
         # Left Sidebar
         self.sidebar = ChatSidebar()
         self.sidebar.new_chat_clicked.connect(self._start_new_chat)
         self.sidebar.chat_selected.connect(self._load_conversation)
+        self.sidebar.chat_delete_requested.connect(self._on_chat_delete_requested)
         self.sidebar.chat_deleted.connect(self._on_chat_deleted)
         self.sidebar.settings_clicked.connect(self._open_settings)
-        self.sidebar.wip_clicked.connect(self._jump_to_wip)
-        splitter.addWidget(self.sidebar)
+        self.sidebar.toggle_requested.connect(self._toggle_sidebar)
+        self.sidebar.chat_renamed.connect(self._on_chat_renamed)
+        self.shell_splitter.addWidget(self.sidebar)
 
-        # Right Area
-        right_area = QWidget()
-        right_layout = QVBoxLayout(right_area)
+        # Chat workspace and library occupy separate pages; plans and files live
+        # in a collapsible inspector beside the conversation.
+        self.page_stack = QStackedWidget()
+        self.shell_splitter.addWidget(self.page_stack)
+        self.chat_workspace = QWidget()
+        right_layout = QVBoxLayout(self.chat_workspace)
         right_layout.setContentsMargins(12, 8, 12, 12)
         right_layout.setSpacing(6)
 
@@ -278,30 +423,20 @@ class ChatPage(QWidget):
         self.top_bar.keep_warm_requested.connect(self._on_keep_warm_requested)
         self.top_bar.connection_expired.connect(self._on_connection_expired)
         self.top_bar.set_mode(self._settings.get("coding_mode", "auto"))
+        self.top_bar.set_low_power_mode(bool(self._settings.get("low_power_mode", False)))
+        self.sidebar.set_low_power_mode(bool(self._settings.get("low_power_mode", False)))
         self.top_bar.set_keep_alive_seconds(get_effective_keep_alive_seconds(self._settings))
         self.top_bar.set_internet_access(bool(self._settings.get("internet_access", False)))
         right_layout.addWidget(self.top_bar)
 
-        # Center Tabs
-        self.tabs = QTabWidget()
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
-        if sb := self.scroll_area.verticalScrollBar():
-            sb.valueChanged.connect(self._on_scroll_value_changed)
-        self.history_container = QWidget()
-        self.history_layout = QVBoxLayout(self.history_container)
-        self.history_layout.setContentsMargins(0, 0, 0, 0)
-        self.history_layout.addStretch()
-        self.scroll_area.setWidget(self.history_container)
+        # Main conversation column
+        self.chat_views_stack = QStackedWidget()
 
         self.plan_panel = PlanPanel()
         self.plan_panel.plan_approved.connect(self._on_plan_approved)
-        self.plan_panel.plan_rejected.connect(lambda: self.tabs.setCurrentIndex(0))
 
         self.research_plan_panel = ResearchPlanPanel()
         self.research_plan_panel.plan_approved.connect(self._on_research_plan_approved)
-        self.research_plan_panel.plan_cancelled.connect(lambda: self.tabs.setCurrentIndex(0))
 
         self.plan_stack = QStackedWidget()
         self.plan_stack.addWidget(self.plan_panel)
@@ -312,11 +447,82 @@ class ChatPage(QWidget):
         self.research_panel = ResearchPanel()
         self.research_panel.resume_requested.connect(self._resume_research)
 
-        self.tabs.addTab(self.scroll_area, "💬 Chat")
-        self.tabs.addTab(self.plan_stack, "📋 Plan")
-        self.tabs.addTab(self.artifacts_panel, "📦 Artifacts")
-        self.tabs.addTab(self.research_panel, "📚 Research")
-        right_layout.addWidget(self.tabs)
+        center_row = QHBoxLayout()
+        center_row.setContentsMargins(0, 0, 0, 0)
+        center_row.setSpacing(8)
+        center_row.addWidget(self.chat_views_stack, 1)
+
+        self.inspector = QWidget()
+        self.inspector.setObjectName("Inspector")
+        self.inspector.setFixedWidth(DARK.sizes.inspector_width)
+        inspector_layout = QVBoxLayout(self.inspector)
+        inspector_layout.setContentsMargins(8, 0, 0, 0)
+        inspector_layout.setSpacing(8)
+        inspector_header = QHBoxLayout()
+        inspector_header.setSpacing(4)
+        self.btn_inspector_plan = QPushButton("Plan")
+        self.btn_inspector_plan.setIcon(icon("list-checks"))
+        self.btn_inspector_plan.setCheckable(True)
+        self.btn_inspector_files = QPushButton("Files")
+        self.btn_inspector_files.setIcon(icon("package"))
+        self.btn_inspector_files.setCheckable(True)
+        for button in (self.btn_inspector_plan, self.btn_inspector_files):
+            button.setProperty("variant", "ghost")
+            inspector_header.addWidget(button)
+        self.btn_inspector_plan.clicked.connect(self._show_plan)
+        self.btn_inspector_files.clicked.connect(self._show_files)
+        self.btn_inspector_close = QToolButton()
+        self.btn_inspector_close.setIcon(icon("x"))
+        self.btn_inspector_close.setToolTip("Close inspector (Ctrl+Shift+B)")
+        self.btn_inspector_close.setProperty("variant", "ghost")
+        self.btn_inspector_close.setProperty("iconOnly", "true")
+        self.btn_inspector_close.clicked.connect(self._toggle_inspector)
+        inspector_header.addStretch()
+        inspector_header.addWidget(self.btn_inspector_close)
+        inspector_layout.addLayout(inspector_header)
+
+        self.inspector_stack = QStackedWidget()
+        self.inspector_stack.addWidget(self.plan_stack)
+        self.inspector_stack.addWidget(self.artifacts_panel)
+        inspector_layout.addWidget(self.inspector_stack, 1)
+        self.inspector.hide()
+        center_row.addWidget(self.inspector)
+        right_layout.addLayout(center_row, 1)
+
+        library_page = QWidget()
+        library_layout = QVBoxLayout(library_page)
+        library_layout.setContentsMargins(12, 8, 12, 12)
+        library_header = QHBoxLayout()
+        back_to_chat = QPushButton("Back to chat")
+        back_to_chat.setIcon(icon("chevron-right"))
+        back_to_chat.clicked.connect(self._show_chat)
+        library_header.addWidget(back_to_chat)
+        library_header.addStretch()
+        library_layout.addLayout(library_header)
+        library_layout.addWidget(self.research_panel, 1)
+
+        self.page_stack.addWidget(self.chat_workspace)
+        self.page_stack.addWidget(library_page)
+        self.navigation = Navigator(
+            self.page_stack,
+            self.chat_workspace,
+            library_page,
+            self.inspector_stack,
+            self.plan_stack,
+            self.artifacts_panel,
+            self.inspector,
+        )
+        self.plan_panel.plan_rejected.connect(self.navigation.show_chat)
+        self.research_plan_panel.plan_cancelled.connect(self.navigation.show_chat)
+        self.sidebar.library_clicked.connect(self.navigation.show_library)
+        self.shell_splitter.setCollapsible(0, True)
+        self.shell_splitter.setSizes([DARK.sizes.sidebar_width, 900])
+        self._sidebar_animation = QPropertyAnimation(self.sidebar, b"maximumWidth", self)
+        self._sidebar_animation.setDuration(160)
+        self._sidebar_collapsed = False
+        self.sidebar.setMinimumWidth(0)
+        self.sidebar.setMaximumWidth(DARK.sizes.sidebar_width)
+        self._create_session_controller(ChatSession(id=self._current_chat_id))
 
         # Removable Attachment Chips Bar
         self.attachment_bar = QWidget()
@@ -326,44 +532,448 @@ class ChatPage(QWidget):
         self.attachment_bar.setVisible(False)
         right_layout.addWidget(self.attachment_bar)
 
-        # Bottom Input Area
-        input_row = QHBoxLayout()
+        self.composer = Composer(self)
+        self.input_edit = self.composer.input_edit
+        self.composer.send_requested.connect(self._send_message)
+        self.composer.stop_requested.connect(self._stop_generation)
 
-        self.btn_attach = QToolButton()
-        self.btn_attach.setText("➕")
-        self.btn_attach.setToolTip("Attach an existing project or artifact")
-        self.btn_attach.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.btn_attach.setStyleSheet(
-            "QToolButton { font-size: 15px; font-weight: bold; padding: 4px 8px; "
-            "background-color: #282c34; border: 1px solid #3e4451; border-radius: 4px; color: #61afef; }"
-            "QToolButton:hover { background-color: #3e4451; color: #ffffff; }"
-        )
+        self.btn_attach = self.composer.btn_attach
         self.attach_menu = QMenu(self)
         self.artifacts_submenu = QMenu("Artifacts", self.attach_menu)
         self.artifacts_submenu.aboutToShow.connect(self._populate_artifacts_submenu)
         self.attach_menu.addMenu(self.artifacts_submenu)
         self.btn_attach.setMenu(self.attach_menu)
-        input_row.addWidget(self.btn_attach)
 
-        self.input_edit = ChatInputEdit()
-        self.input_edit.setPlaceholderText("Type a message or coding request… (Enter to send, Shift+Enter for new line)")
-        self.input_edit.setMaximumHeight(80)
-        self.input_edit.send_requested.connect(self._send_message)
-        input_row.addWidget(self.input_edit)
+        right_layout.addWidget(self.composer)
+        self._activate_controller(self._active_controller)
+        self._install_shortcuts()
 
-        btn_box = QVBoxLayout()
-        self.btn_send, self.btn_stop = QPushButton("Send"), QPushButton("Stop")
-        self.btn_send.setStyleSheet("font-weight: bold; padding: 6px 12px;")
-        self.btn_send.clicked.connect(self._send_message)
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self._stop_generation)
-        btn_box.addWidget(self.btn_send)
-        btn_box.addWidget(self.btn_stop)
-        input_row.addLayout(btn_box)
+    def _install_shortcuts(self) -> None:
+        shortcuts = (
+            ("Ctrl+N", self._start_new_chat),
+            ("Ctrl+K", self.sidebar.search_input.setFocus),
+            ("Ctrl+B", self._toggle_sidebar),
+            ("Ctrl+Shift+B", self._toggle_inspector),
+            ("Ctrl+,", self._open_settings),
+            ("Esc", self._stop_generation),
+        )
+        for sequence, callback in shortcuts:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.activated.connect(callback)
 
-        right_layout.addLayout(input_row)
-        splitter.addWidget(right_area)
-        splitter.setSizes([200, 700])
+    def _show_chat(self) -> None:
+        self.navigation.show_chat()
+        self.input_edit.setFocus()
+
+    def _show_plan(self) -> None:
+        self.navigation.show_plan()
+        self.btn_inspector_plan.setChecked(True)
+        self.btn_inspector_files.setChecked(False)
+
+    def _show_files(self) -> None:
+        self.navigation.show_files()
+        self.btn_inspector_plan.setChecked(False)
+        self.btn_inspector_files.setChecked(True)
+
+    def _restore_navigation_view(self, view: str) -> None:
+        self.navigation.restore_view(view)
+        self.btn_inspector_plan.setChecked(view == "plan")
+        self.btn_inspector_files.setChecked(view == "files")
+
+    def _toggle_inspector(self) -> None:
+        if self.inspector.isVisible():
+            self.inspector.hide()
+        elif self.inspector_stack.currentWidget() is self.artifacts_panel:
+            self._show_files()
+        else:
+            self._show_plan()
+
+    def set_sidebar_collapsed(self, collapsed: bool) -> None:
+        self._sidebar_collapsed = collapsed
+        width = 0 if collapsed else DARK.sizes.sidebar_width
+        self.sidebar.setMaximumWidth(width)
+        if collapsed or self.shell_splitter.sizes()[0] == 0:
+            self.shell_splitter.setSizes([width, max(1, self.width() - width)])
+
+    @property
+    def sidebar_collapsed(self) -> bool:
+        return self._sidebar_collapsed
+
+    def _toggle_sidebar(self) -> None:
+        self._sidebar_collapsed = not self._sidebar_collapsed
+        target_width = 0 if self._sidebar_collapsed else DARK.sizes.sidebar_width
+        low_power = bool(self._settings.get("low_power_mode", False))
+        if low_power:
+            self.sidebar.setMaximumWidth(target_width)
+            self.shell_splitter.setSizes([target_width, max(1, self.width() - target_width)])
+            return
+        self._sidebar_animation.stop()
+        if target_width and self.sidebar.maximumWidth() == 0:
+            self.shell_splitter.setSizes([target_width, max(1, self.width() - target_width)])
+        self._sidebar_animation.setStartValue(self.sidebar.width())
+        self._sidebar_animation.setEndValue(target_width)
+        self._sidebar_animation.start()
+
+    def _on_chat_renamed(self, chat_id: str, title: str) -> None:
+        controller = self._controllers.get(chat_id)
+        if controller is not None:
+            controller.session.title = title
+            controller.session.ai_title = True
+            self._on_controller_persist_needed(controller)
+            return
+        if data := load_chat(chat_id):
+            data["title"] = title
+            data["ai_title"] = True
+            save_chat(data)
+        self.sidebar.refresh_list()
+
+    def _create_session_controller(
+        self,
+        session: ChatSession,
+        view: ChatView | None = None,
+    ) -> SessionController:
+        controller = SessionController(session, view, parent=self)
+        controller.persist_needed.connect(self._on_controller_persist_needed)
+        controller.chat_complete.connect(self._on_controller_chat_complete)
+        controller.worker_failed.connect(self._on_controller_worker_failed)
+        controller.plan_complete.connect(self._on_controller_plan_complete)
+        controller.classify_done.connect(self._on_controller_classify_done)
+        controller.route_done.connect(self._on_controller_route_done)
+        controller.compaction_notice.connect(self._on_controller_compaction_notice)
+        controller.generating_progress.connect(
+            lambda count, cid=session.id: self._on_controller_token_count(cid, count)
+        )
+        controller.status_text.connect(
+            lambda text, cid=session.id: self._show_session_status(cid, text)
+        )
+        controller.became_busy.connect(
+            lambda _controller, cid=session.id: self._update_sidebar_session(cid)
+        )
+        controller.became_idle.connect(
+            self._on_controller_became_idle
+        )
+        controller.unread_changed.connect(
+            lambda cid, unread: self.sidebar.set_chat_state(cid, unread=unread)
+        )
+        self._controllers[session.id] = controller
+        self._ensure_chat_view(controller)
+        return controller
+
+    def _ensure_chat_view(self, controller: SessionController) -> ChatView:
+        if controller.view is None:
+            view = ChatView(self.chat_views_stack)
+            view.rebuild(
+                controller.session.messages,
+                controller.session.current_stream_text()
+                if controller.session.status == "generating"
+                else controller.session.draft_assistant or "",
+            )
+            controller.view = view
+            self.chat_views_stack.addWidget(view)
+            view.retry_clicked.connect(
+                lambda cid=controller.chat_id: self._on_retry_clicked_for_chat(cid)
+            )
+            view.load_earlier_clicked.connect(
+                lambda cid=controller.chat_id: self._load_earlier_for_chat(cid)
+            )
+        return controller.view
+
+    def _activate_controller(self, controller: SessionController) -> None:
+        previous = self._controllers.get(self._current_chat_id)
+        if previous is not None and previous is not controller:
+            previous.set_visible(False)
+        self._current_chat_id = controller.chat_id
+        view = self._ensure_chat_view(controller)
+        controller.set_visible(True)
+        self._view_last_used[controller.chat_id] = time.monotonic()
+        self.chat_views_stack.setCurrentWidget(view)
+        self.scroll_area = view.scroll_area
+        self.history_container = view.history_container
+        self.history_layout = view.history_layout
+        self._apply_view_limit()
+        self._sync_active_controls()
+
+    def _apply_view_limit(self) -> None:
+        live = [
+            controller
+            for controller in self._controllers.values()
+            if controller.view is not None
+        ]
+        while len(live) > _MAX_LIVE_VIEWS:
+            candidates = [c for c in live if c.chat_id != self._current_chat_id]
+            if not candidates:
+                return
+            oldest = min(candidates, key=lambda c: self._view_last_used.get(c.chat_id, 0))
+            view = oldest.view
+            if view is not None:
+                self.chat_views_stack.removeWidget(view)
+                view.deleteLater()
+                oldest.view = None
+            live.remove(oldest)
+
+    def _sync_active_controls(self) -> None:
+        controller = self._active_controller
+        busy = controller.is_busy() or (
+            self._build_running and self._building_chat_id == controller.chat_id
+        )
+        self.composer.set_generating(busy)
+        self.composer.set_send_enabled(not busy)
+        if busy:
+            self.top_bar.set_working()
+
+    def _update_sidebar_session(self, chat_id: str) -> None:
+        controller = self._controllers.get(chat_id)
+        if controller is not None:
+            self.sidebar.set_chat_state(
+                chat_id,
+                status=controller.session.status,
+                unread=controller.session.unread,
+            )
+
+    def _on_controller_became_idle(self, controller: SessionController) -> None:
+        self._update_sidebar_session(controller.chat_id)
+        if controller.chat_id == self._current_chat_id:
+            self._sync_active_controls()
+            if controller.session.status in ("idle", "error"):
+                self.top_bar.set_idle()
+
+    def _show_session_status(self, chat_id: str, text: str) -> None:
+        if chat_id == self._current_chat_id:
+            self.top_bar.show_status(text)
+
+    def _on_controller_persist_needed(self, controller: SessionController) -> None:
+        if (
+            controller.chat_id in self._deleted_chat_ids
+            or self._controllers.get(controller.chat_id) is not controller
+        ):
+            return
+        session = controller.session
+        if not session.messages:
+            return
+        title = session.title or next(
+            (
+                str(msg.get("content", ""))[:30]
+                + ("…" if len(str(msg.get("content", ""))) > 30 else "")
+                for msg in session.messages
+                if msg.get("role") == "user"
+            ),
+            "New Chat",
+        )
+        session.title = title
+        data = controller.persist_dict()
+        data["title"] = title
+        data["ai_title"] = session.ai_title
+        if not session.workspace_id:
+            data["artifacts"] = dict(session.build_files)
+        if controller.view is not None:
+            controller.view.update_message_model(session.messages)
+        save_chat(data)
+        self.sidebar.upsert_chat(
+            controller.chat_id,
+            title,
+            status=session.status,
+            unread=session.unread,
+        )
+
+    def _save_streaming_drafts(self) -> None:
+        for controller in tuple(self._controllers.values()):
+            session = controller.session
+            if session.is_busy() and (session.streaming or session.draft_assistant):
+                self._on_controller_persist_needed(controller)
+
+    def _on_controller_chat_complete(
+        self,
+        controller: SessionController,
+        full_content: str,
+        meta: dict[str, Any],
+    ) -> None:
+        session = controller.session
+        if session.is_hybrid_mode and controller.coding_plan:
+            plan = controller.coding_plan
+            full_content += (
+                f"\n\n---\n### Project Plan Ready: {plan.goal} ({len(plan.steps)} steps)\n\n"
+                + "\n".join(
+                    f"- **Step {step.step}**: {step.description} → `{step.file}`"
+                    for step in plan.steps
+                )
+                + "\n\nA complete project plan has been prepared in the **Plan** tab! "
+                "Switch to the Plan tab and click **Approve & Start Coding** whenever you're ready."
+            )
+            session.is_hybrid_mode = False
+            if session.messages and session.messages[-1].get("role") == "assistant":
+                session.messages[-1]["content"] = full_content
+                if controller.view is not None:
+                    controller.view.rebuild(session.messages)
+        if controller is self._active_controller:
+            self.top_bar.set_idle()
+            self.top_bar.hide_status()
+            self._last_prompt_eval_tokens = int(
+                meta.get("prompt_eval_count", 0) or 0
+            ) + int(meta.get("eval_count", 0) or 0)
+            self._update_token_meter()
+            if controller.view is not None:
+                controller.view.add_retry_button()
+        self._on_controller_persist_needed(controller)
+        if not session.ai_title and session.last_user_prompt:
+            self._request_ai_chat_title(
+                controller.chat_id,
+                session.last_user_prompt,
+                session.model or self.top_bar.current_model(),
+                self._settings.get("ollama_url", "http://localhost:11434"),
+                session.num_ctx,
+            )
+        if session.sequential_plan_args:
+            args = session.sequential_plan_args
+            session.sequential_plan_args = None
+            self._run_for_controller(
+                controller,
+                self._start_sequential_plan,
+                *args,
+                full_content,
+                meta,
+            )
+
+    def _on_controller_worker_failed(self, controller: SessionController, err_msg: str) -> None:
+        if controller is self._active_controller:
+            self.top_bar.set_idle()
+            self.top_bar.hide_status()
+            if controller.view is not None:
+                controller.view.add_retry_button()
+        self._on_controller_persist_needed(controller)
+
+    def _on_controller_plan_complete(
+        self,
+        controller: SessionController,
+        plan: CodingPlan,
+    ) -> None:
+        callback = self._on_hybrid_plan_ready if controller.plan_hybrid else self._on_plan_ready
+        self._run_for_controller(controller, callback, plan)
+
+    def _on_controller_classify_done(
+        self,
+        controller: SessionController,
+        task_type: str,
+    ) -> None:
+        args = controller.classify_args or ()
+        self._run_for_controller(controller, self._on_classify_done, task_type, *args)
+
+    def _on_controller_route_done(
+        self,
+        controller: SessionController,
+        decision: str,
+    ) -> None:
+        args = controller.route_args or ()
+        self._run_for_controller(controller, self._on_route_resolved, decision, *args)
+
+    def _connect_for_controller(
+        self,
+        signal: Any,
+        controller: SessionController,
+        callback: Any,
+    ) -> None:
+        signal.connect(
+            lambda *args, c=controller, fn=callback: self._run_for_controller(c, fn, *args)
+        )
+
+    def _on_controller_compaction_notice(
+        self,
+        controller: SessionController,
+        old_tokens: int,
+        new_tokens: int,
+    ) -> None:
+        if controller.view is not None:
+            controller.view.add_notice(
+                f"Compacted conversation (~{old_tokens:,} → ~{new_tokens:,} tokens)"
+            )
+        if controller is self._active_controller:
+            self._update_token_meter()
+
+    def _on_controller_token_count(self, chat_id: str, count: int) -> None:
+        if chat_id == self._current_chat_id:
+            self.top_bar.notify_activity()
+            self.top_bar.show_status(f"Generating ({count} tokens)…")
+
+    def _on_retry_clicked_for_chat(self, chat_id: str) -> None:
+        if chat_id != self._current_chat_id:
+            return
+        self._on_retry_clicked()
+
+    def _load_earlier_for_chat(self, chat_id: str) -> None:
+        controller = self._controllers.get(chat_id)
+        if controller and controller.view:
+            controller.view.load_earlier()
+
+    def _set_controller_context(self, controller: SessionController) -> None:
+        self._current_chat_id = controller.chat_id
+        view = self._ensure_chat_view(controller)
+        self.scroll_area = view.scroll_area
+        self.history_container = view.history_container
+        self.history_layout = view.history_layout
+
+    def _run_for_controller(
+        self,
+        controller: SessionController,
+        callback: Any,
+        *args: Any,
+    ) -> None:
+        """Run a legacy page callback against its owning session, never the visible chat."""
+        if (
+            controller.chat_id in self._deleted_chat_ids
+            or self._controllers.get(controller.chat_id) is not controller
+        ):
+            return
+        if controller.chat_id == self._current_chat_id:
+            callback(*args)
+            return
+        visible_id = self._current_chat_id
+        visible_view = self.navigation.current_view
+        status_text = self.top_bar.lbl_status.text()
+        status_visible = self.top_bar.status_container.isVisible()
+        progress_value = self.top_bar.progress_bar.value()
+        status_icon_pixmap = self.top_bar._status_icon.pixmap()
+        status_icon_hidden = self.top_bar._status_icon.isHidden()
+        status_spinner_hidden = self.top_bar._status_spinner.isHidden()
+        connection = self.top_bar.lbl_connection
+        connection_state = (
+            connection.text(),
+            connection.toolTip(),
+            connection.property("state"),
+            self.top_bar._is_connected,
+            self.top_bar._is_working,
+            self.top_bar._seconds_remaining,
+            self.top_bar._keep_alive_timer.isActive(),
+        )
+        try:
+            self._set_controller_context(controller)
+            callback(*args)
+        finally:
+            self._set_controller_context(self._controllers[visible_id])
+            self._restore_navigation_view(visible_view)
+            self.top_bar.lbl_status.setText(status_text)
+            if status_icon_pixmap is None:
+                self.top_bar._status_icon.clear()
+            else:
+                self.top_bar._status_icon.setPixmap(status_icon_pixmap)
+            self.top_bar._status_icon.setVisible(not status_icon_hidden)
+            self.top_bar._status_spinner.setVisible(not status_spinner_hidden)
+            self.top_bar.status_container.setVisible(status_visible)
+            self.top_bar.progress_bar.setValue(progress_value)
+            (
+                badge_text,
+                badge_tooltip,
+                badge_state,
+                self.top_bar._is_connected,
+                self.top_bar._is_working,
+                self.top_bar._seconds_remaining,
+                timer_active,
+            ) = connection_state
+            connection.setText(badge_text)
+            connection.setToolTip(badge_tooltip)
+            set_property(connection, "state", badge_state)
+            if timer_active and not self.top_bar._keep_alive_timer.isActive():
+                self.top_bar._keep_alive_timer.start()
+            elif not timer_active:
+                self.top_bar._keep_alive_timer.stop()
 
     def set_models(self, models: list[str]) -> None:
         self._models = models
@@ -389,7 +999,7 @@ class ChatPage(QWidget):
 
     def _refresh_models(self) -> None:
         # Avoid socket contention if active generation or code building is running
-        if self._build_running or (self._active_chat_worker and self._active_chat_worker.isRunning()):
+        if self._build_running or worker_is_running(self._active_chat_worker):
             return
         w = ModelsWorker(self._settings.get("ollama_url", "http://localhost:11434"), parent=self)
         w.models_ready.connect(self.set_models)
@@ -438,7 +1048,7 @@ class ChatPage(QWidget):
                 name = ws.get("name", "Untitled")
                 cnt = ws.get("file_count", len(ws.get("files", {})))
                 dt = ws.get("updated", "")[:10] or ws.get("created", "")[:10]
-                act = self.artifacts_submenu.addAction(f"💻 {name} ({cnt} files, {dt})")
+                act = self.artifacts_submenu.addAction(icon("file-code"), f"{name} ({cnt} files, {dt})")
                 wid = ws.get("id")
                 act.triggered.connect(lambda checked=False, w_id=wid, w_name=name: self._add_attachment(w_id, w_name, "code"))
 
@@ -446,7 +1056,7 @@ class ChatPage(QWidget):
             for rp in research_projects:
                 t = (rp.get("title") or rp.get("topic") or "Research")[:30]
                 dt = rp.get("date", "")[:10]
-                act = self.artifacts_submenu.addAction(f"🔬 {t} [Research] ({dt})")
+                act = self.artifacts_submenu.addAction(icon("flask"), f"{t} [Research] ({dt})")
                 rid = rp.get("id")
                 act.triggered.connect(lambda checked=False, r_id=rid, r_name=t: self._add_attachment(r_id, r_name, "research"))
 
@@ -472,23 +1082,25 @@ class ChatPage(QWidget):
 
         for att in self._pending_attachments:
             chip = QWidget()
+            chip.setProperty("role", "card")
+            chip.setObjectName("AttachmentChip")
             chip_layout = QHBoxLayout(chip)
             chip_layout.setContentsMargins(6, 2, 6, 2)
             chip_layout.setSpacing(4)
-            chip.setStyleSheet(
-                "QWidget { background-color: #2c313a; border: 1px solid #3e4451; border-radius: 12px; }"
-            )
-            icon = "🔬 " if att.get("kind") == "research" else "📎 "
-            lbl = QLabel(f"{icon}{att['name']}")
-            lbl.setStyleSheet("color: #61afef; font-size: 11px; font-weight: bold; border: none; background: transparent;")
+            icon_name = "flask" if att.get("kind") == "research" else "file"
+            icon_label = QLabel()
+            icon_label.setPixmap(icon(icon_name, DARK.colors.text_secondary, 16).pixmap(16, 16))
+            chip_layout.addWidget(icon_label)
+            lbl = QLabel(att["name"])
+            lbl.setProperty("role", "muted")
             chip_layout.addWidget(lbl)
 
-            btn_del = QPushButton("✕")
-            btn_del.setFixedSize(16, 16)
-            btn_del.setStyleSheet(
-                "QPushButton { border: none; background: transparent; color: #abb2bf; font-size: 10px; font-weight: bold; } "
-                "QPushButton:hover { color: #e06c75; }"
-            )
+            btn_del = QPushButton()
+            btn_del.setIcon(icon("x"))
+            btn_del.setFixedSize(32, 32)
+            btn_del.setToolTip("Remove attachment")
+            set_variant(btn_del, "danger")
+            set_property(btn_del, "iconOnly", "true")
             att_id = att["id"]
             btn_del.clicked.connect(lambda checked=False, a_id=att_id: self._remove_attachment(a_id))
             chip_layout.addWidget(btn_del)
@@ -501,102 +1113,79 @@ class ChatPage(QWidget):
     # ── Chat & Tab Navigation ──────────────────────────────────────────
 
     def _start_new_chat(self) -> None:
-        # Only save if there are actual messages to save (prevents ghost chats)
-        if self._messages:
-            self._save_current_conversation()
-
-        # Stop any active chat/plan workers, but leave CodeWorker running in background!
-        self._stop_chat_generation()
-
-        self._current_chat_id = str(uuid.uuid4())
-        self._current_chat_title = None
-        self._current_chat_has_ai_title = False
-        self._messages = []
-        self._last_prompt_eval_tokens = 0
-        self._active_plan = None
-        self._build_files = {}
-        self._last_user_prompt = ""
-        self._workspace_id = None
-        self._workspace_ids_history = []
-        self._research_project_id = None
-        self._pending_project_target = None
-        self._pending_attachments = []
-        self._last_user_attachments = []
-        self._last_extra_system = ""
+        self._save_current_conversation()
+        controller = self._create_session_controller(ChatSession())
+        self._activate_controller(controller)
         self._render_attachment_chips()
-
-        self._clear_history_ui()
         self.artifacts_panel.clear()
         self.sidebar.clear_selection()
         self._update_token_meter()
 
+        self._active_plan = None
         self.plan_panel.btn_approve.setText("Approve & Start Coding")
         self.plan_panel.btn_approve.setEnabled(True)
-        self.tabs.setCurrentIndex(0)
+        self.navigation.show_chat()
+
+    def _on_chat_delete_requested(self, chat_id: str) -> None:
+        self._deleted_chat_ids.add(chat_id)
+        controller = self._controllers.get(chat_id)
+        if controller and controller.is_busy():
+            controller.stop_chat_workers()
+        if chat_id == self._building_chat_id and worker_is_running(self._active_code_worker):
+            request_stop(self._active_code_worker)
+            wait_briefly(self._active_code_worker, 2000)
+            self._build_running = worker_is_running(self._active_code_worker)
+            if not self._build_running:
+                self._building_chat_id = None
+                self._building_plan = None
+                self._building_files = {}
+                self._building_workspace_id = None
+                self._active_code_worker = None
 
     def _on_chat_deleted(self, chat_id: str) -> None:
         """Handle a chat being deleted from the sidebar."""
-        if chat_id == self._current_chat_id:
-            # The active chat was deleted — reset to a fresh state without saving
-            self._stop_chat_generation()
+        controller = self._controllers.pop(chat_id, None)
+        was_current = chat_id == self._current_chat_id
+        if controller:
+            if controller.is_busy():
+                controller.stop_chat_workers()
+            if controller.view is not None:
+                self.chat_views_stack.removeWidget(controller.view)
+                controller.view.deleteLater()
+            self._view_last_used.pop(chat_id, None)
+        if was_current:
             self._current_chat_id = str(uuid.uuid4())
-            self._current_chat_title = None
-            self._current_chat_has_ai_title = False
-            self._messages = []
-            self._last_prompt_eval_tokens = 0
-            self._active_plan = None
-            self._build_files = {}
-            self._last_user_prompt = ""
-            self._clear_history_ui()
+            new_controller = self._create_session_controller(
+                ChatSession(id=self._current_chat_id)
+            )
+            self._activate_controller(new_controller)
             self.artifacts_panel.clear()
             self.sidebar.clear_selection()
             self._update_token_meter()
             self.plan_panel.btn_approve.setText("Approve & Start Coding")
             self.plan_panel.btn_approve.setEnabled(True)
-            self.tabs.setCurrentIndex(0)
-
-    def _clear_history_ui(self) -> None:
-        while self.history_layout.count() > 1:
-            if (item := self.history_layout.takeAt(0)) and item.widget():
-                item.widget().deleteLater()
+            self.navigation.show_chat()
 
     def _load_conversation(self, chat_id: str) -> None:
         if chat_id == self._current_chat_id:
             if self._build_running or self._build_files:
-                self.tabs.setCurrentIndex(2)
+                self._show_files()
             return
 
-        # Only save previous conversation if it has messages (prevents ghost chats)
-        if self._messages:
-            self._save_current_conversation()
+        self._save_current_conversation()
+        controller = self._controllers.get(chat_id)
+        if controller is None:
+            data = load_chat(chat_id)
+            if not data:
+                return
+            session = ChatSession.from_dict(data)
+            controller = self._create_session_controller(session)
+            if saved_plan := data.get("plan"):
+                controller.coding_plan = reconstruct_plan(saved_plan)
 
-        # Stop active chat/plan workers, NEVER kill background CodeWorker!
-        self._stop_chat_generation()
-
-        if not (data := load_chat(chat_id)):
-            return
-
-        self._current_chat_id = chat_id
-        self._current_chat_title = data.get("title")
-        self._current_chat_has_ai_title = bool(data.get("ai_title", False))
-        self._messages = data.get("messages", [])
-        self._last_prompt_eval_tokens = 0
-        self._workspace_id = data.get("workspace_id")
-        self._research_project_id = data.get("research_project_id")
-        self._clear_history_ui()
-
-        # Lazy-load: only show last 40 messages, add "Load earlier" button if needed
-        self._lazy_load_offset = 0
-        if len(self._messages) > 40:
-            self._lazy_load_offset = len(self._messages) - 40
-            self._add_load_earlier_button()
-            visible = self._messages[self._lazy_load_offset:]
-        else:
-            visible = self._messages
-        for msg in visible:
-            self.history_layout.insertWidget(self.history_layout.count() - 1, ChatMessageWidget(msg["role"], msg["content"]))
-
-        # Add retry button for the last assistant message
+        self._activate_controller(controller)
+        self.navigation.show_chat()
+        data = controller.persist_dict()
         self._add_retry_button()
 
         # If switching into the chat that is currently building in background:
@@ -613,20 +1202,14 @@ class ChatPage(QWidget):
                         self.plan_panel.mark_step_completed(s.step)
             self.plan_panel.btn_approve.setText("Building in Progress…")
             self.plan_panel.btn_approve.setEnabled(False)
-            self.tabs.setCurrentIndex(2)
+            self._show_files()
         else:
             self.artifacts_panel.clear()
             old_artifacts = data.get("artifacts", {})
 
             if self._workspace_id:
-                # Load files from the workspace on disk
                 self._build_files = workspace.read_all(self._workspace_id)
-                for fname, code in self._build_files.items():
-                    self.artifacts_panel.add_file(fname, code)
-                try:
-                    self.artifacts_panel.load_workspace(self._workspace_id)
-                except Exception:
-                    pass
+                self.artifacts_panel.load_workspace(self._workspace_id)
             elif old_artifacts:
                 # Migration: old chat stored file contents inline — create a workspace for them
                 plan_goal = ""
@@ -651,14 +1234,14 @@ class ChatPage(QWidget):
                 self._build_files = {}
 
             if saved_plan := data.get("plan"):
-                self._active_plan = reconstruct_plan(saved_plan)
+                self._active_plan = controller.coding_plan or reconstruct_plan(saved_plan)
                 self.plan_panel.set_plan(self._active_plan)
                 for s in self._active_plan.steps:
                     if s.completed:
                         self.plan_panel.mark_step_completed(s.step)
                 all_done = all(s.completed for s in self._active_plan.steps)
                 if all_done:
-                    self.plan_panel.btn_approve.setText("✅ Build Completed")
+                    self.plan_panel.btn_approve.setText("Build completed")
                     self.plan_panel.btn_approve.setEnabled(False)
                 else:
                     self.plan_panel.btn_approve.setText("▶ Resume Building")
@@ -668,11 +1251,11 @@ class ChatPage(QWidget):
                 self.plan_panel.btn_approve.setText("Approve & Start Coding")
                 self.plan_panel.btn_approve.setEnabled(True)
 
-            if session := load_session(chat_id):
-                self._restore_session(session)
-                self.tabs.setCurrentIndex(2)
+            if work_session := load_session(chat_id):
+                self._restore_session(work_session)
+                self._show_files()
             else:
-                self.tabs.setCurrentIndex(2 if self._build_files else 0)
+                self._show_files() if self._build_files else self.navigation.show_chat()
 
         self._update_token_meter()
         self._scroll_to_bottom()
@@ -689,131 +1272,48 @@ class ChatPage(QWidget):
         else:
             self._build_files = dict(session.get("completed_files", {}))
         self.artifacts_panel.clear()
-        for fname, code in self._build_files.items():
-            self.artifacts_panel.add_file(fname, code)
         if ws_id:
-            try:
-                self.artifacts_panel.load_workspace(ws_id)
-            except Exception:
-                pass
+            self.artifacts_panel.load_workspace(ws_id)
+        else:
+            for fname, code in self._build_files.items():
+                self.artifacts_panel.add_file(fname, code)
         self.plan_panel.set_plan(plan)
         for s in plan.steps:
             if s.completed:
                 self.plan_panel.mark_step_completed(s.step)
         all_done = all(s.completed for s in plan.steps)
         if all_done:
-            self.plan_panel.btn_approve.setText("✅ Build Completed")
+            self.plan_panel.btn_approve.setText("Build completed")
             self.plan_panel.btn_approve.setEnabled(False)
         else:
             self.plan_panel.btn_approve.setText("▶ Resume Building")
             self.plan_panel.btn_approve.setEnabled(True)
 
-    def _jump_to_wip(self) -> None:
-        target_id = self.sidebar._wip_chat_id
-        if not target_id:
-            active = list_active_sessions()
-            if active:
-                target_id = active[0]
-        if not target_id:
-            return
-        if target_id == self._current_chat_id:
-            self.tabs.setCurrentIndex(2)
-        else:
-            self._load_conversation(target_id)
-            self.tabs.setCurrentIndex(2)
-
     # ── Retry Button ───────────────────────────────────────────────────
 
     def _add_retry_button(self) -> None:
         """Add a retry button below the last assistant message."""
-        # Remove any existing retry row first
-        self._remove_retry_button()
-
-        # Find the last user message for retry content
-        last_user_msg = ""
-        for m in reversed(self._messages):
-            if m["role"] == "user":
-                last_user_msg = m["content"]
-                break
-
-        if not last_user_msg:
+        view = self._active_controller.view
+        if view is None or not any(m.get("role") == "user" for m in self._messages):
             return
-
-        self._last_user_prompt = last_user_msg
-
-        retry_row = QWidget()
-        retry_row.setObjectName("retry_row")
-        retry_layout = QHBoxLayout(retry_row)
-        retry_layout.setContentsMargins(0, 2, 0, 6)
-        retry_layout.setSpacing(8)
-
-        btn_retry = QPushButton("🔄 Retry Request")
-        btn_retry.setToolTip("Re-run the last prompt")
-        btn_retry.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_retry.setStyleSheet(
-            "QPushButton { font-size: 12px; padding: 4px 14px; background: #282c34; "
-            "color: #abb2bf; border: 1px solid #3e4451; border-radius: 4px; font-weight: bold; }"
-            "QPushButton:hover { background: #3e4451; color: #ffffff; border-color: #61afef; }"
-        )
-        btn_retry.clicked.connect(self._on_retry_clicked)
-        retry_layout.addWidget(btn_retry)
-        retry_layout.addStretch()
-
-        # Insert before the stretch (last item in history_layout)
-        self.history_layout.insertWidget(self.history_layout.count() - 1, retry_row)
+        view.add_retry_button()
 
     def _remove_retry_button(self) -> None:
         """Remove existing retry button row if present."""
-        for i in range(self.history_layout.count() - 1, -1, -1):
-            item = self.history_layout.itemAt(i)
-            if item and item.widget() and item.widget().objectName() == "retry_row":
-                w = self.history_layout.takeAt(i).widget()
-                if w:
-                    w.deleteLater()
+        view = self._active_controller.view
+        if view is not None:
+            view.remove_retry_button()
 
     def _on_retry_clicked(self) -> None:
         """Re-run the last user prompt by removing the old response and resending."""
-        if not self._last_user_prompt:
+        prompt, attachments = self._active_controller.retry_last_turn()
+        if not prompt:
             return
-
-        # Remove the last assistant message from history (if any)
-        if self._messages and self._messages[-1]["role"] == "assistant":
-            self._messages.pop()
-
-        # Remove the retry button and last assistant widget from UI
-        self._remove_retry_button()
-
-        # Remove the last assistant widget from the visual layout
-        for i in range(self.history_layout.count() - 1, -1, -1):
-            item = self.history_layout.itemAt(i)
-            if item and item.widget() and isinstance(item.widget(), ChatMessageWidget):
-                widget = item.widget()
-                if widget.role == "assistant":
-                    self.history_layout.takeAt(i)
-                    widget.deleteLater()
-                    break
-
-        # Put the prompt back in the input and trigger send
-        self.input_edit.setPlainText(self._last_user_prompt)
-
-        # Also remove the user message since _send_message will re-add it
-        if self._messages and self._messages[-1]["role"] == "user":
-            self._messages.pop()
-            # Remove last user widget too
-            for i in range(self.history_layout.count() - 1, -1, -1):
-                item = self.history_layout.itemAt(i)
-                if item and item.widget() and isinstance(item.widget(), ChatMessageWidget):
-                    widget = item.widget()
-                    if widget.role == "user":
-                        self.history_layout.takeAt(i)
-                        widget.deleteLater()
-                        break
-
-        # Restore attachments from the retried message so they re-apply
-        if hasattr(self, "_last_user_attachments") and self._last_user_attachments:
-            self._pending_attachments = list(self._last_user_attachments)
+        self._last_user_prompt = prompt
+        self.composer.set_text(prompt)
+        if attachments:
+            self._pending_attachments = list(attachments)
             self._render_attachment_chips()
-
         self._send_message()
 
     def _build_attachment_context(self, num_ctx: int) -> str:
@@ -832,13 +1332,19 @@ class ChatPage(QWidget):
     # ── Sending & Processing Messages ──────────────────────────────────
 
     def _send_message(self) -> None:
-        text = self.input_edit.toPlainText().strip()
+        text = self.composer.text()
         model = self.top_bar.current_model()
         if not text or not model:
             return
+        if self._active_controller.is_busy() or (
+            self._build_running and self._building_chat_id == self._current_chat_id
+        ):
+            self.top_bar.show_status("Waiting for the current reply")
+            return
 
-        self.input_edit.clear()
+        self.composer.clear()
         self._last_user_prompt = text
+        self._active_controller.session.model = model
 
         # Capture attachments for this message (and restore on retry)
         attachments = list(self._pending_attachments)
@@ -849,6 +1355,7 @@ class ChatPage(QWidget):
         # Build attachment context (capped at 40% of num_ctx) for injection into the chat
         url = self._settings.get("ollama_url", "http://localhost:11434")
         num_ctx = getattr(self, "_active_num_ctx", int(self._settings.get("num_ctx", 8192)))
+        self._active_controller.session.num_ctx = num_ctx
         if attachments:
             budget = max(200, int(num_ctx * 0.40))
             ids = [a["id"] for a in attachments]
@@ -860,37 +1367,32 @@ class ChatPage(QWidget):
         # Remove any existing retry button before adding new messages
         self._remove_retry_button()
 
-        user_msg: dict[str, Any] = {"role": "user", "content": text}
-        if attachments:
-            user_msg["attachments"] = [{"id": a["id"], "name": a["name"]} for a in attachments]
-        self._messages.append(user_msg)
+        self._active_controller.session.add_user(text, attachments)
         att_for_widget = attachments or None
-        self.history_layout.insertWidget(
-            self.history_layout.count() - 1, ChatMessageWidget("user", text, attachments=att_for_widget)
-        )
+        self._active_controller.view.add_user(text, attachments=att_for_widget)
         self._save_current_conversation()
 
         self.top_bar.set_working()
-        self.btn_send.setEnabled(False)
-        self.btn_stop.setEnabled(True)
+        self.composer.set_generating(True)
+        self.composer.set_send_enabled(False)
 
         self._current_assistant_text = []
 
         # AI title is requested after the main reply finishes (see _on_chat_finished / _on_plan_ready)
         # to avoid model reload races when num_ctx differs.
 
-        est_tokens = estimate_messages_tokens(self._messages)
+        est_tokens = estimate_messages_tokens(self._active_controller.session.model_messages())
         if self._last_extra_system:
             est_tokens += estimate_messages_tokens([{"role": "system", "content": self._last_extra_system}])
         if is_compaction_needed(est_tokens, num_ctx, threshold_ratio=0.75):
-            self.top_bar.show_status(f"⚡ Checking tokens ({est_tokens:,}/{num_ctx:,}) — compacting history…", 30)
+            self.top_bar.show_status(f"Checking tokens ({est_tokens:,}/{num_ctx:,}) — compacting history…", 30)
 
         mode = self.top_bar.current_mode()
         extracted_urls = extract_urls(text)
         if mode in ("auto", "chat") and extracted_urls:
             if not self._settings.get("internet_access", False):
                 err = (
-                    "🌐 **Web access is disabled in Settings.**\n\n"
+                    "**Web access is disabled in Settings.**\n\n"
                     "Enable **Internet Access** in Settings to allow fetching and analyzing web pages."
                 )
                 self._current_assistant_widget = ChatMessageWidget("assistant", err)
@@ -913,10 +1415,11 @@ class ChatPage(QWidget):
                 waw = self._active_chat_worker = WebAnswerWorker(
                     url, model, text, extracted_urls, options=opts, parent=self
                 )
-                waw.status_message.connect(self.top_bar.show_status)
-                waw.token_received.connect(self._on_token_received)
-                waw.chat_finished.connect(self._on_chat_finished)
-                waw.chat_error.connect(self._on_worker_error)
+                controller = self._active_controller
+                waw.status_message.connect(
+                    lambda status, cid=controller.chat_id: self._show_session_status(cid, status)
+                )
+                controller.bind_chat_worker(waw)
                 waw.finished.connect(waw.deleteLater)
                 waw.start()
                 self._scroll_to_bottom(force=True)
@@ -944,11 +1447,13 @@ class ChatPage(QWidget):
                     self._dispatch_task(heuristic_result, text, url, model, num_ctx)
                 else:
                     # Ambiguous — run LLM classifier in background thread (prevents 5-15s freeze)
-                    self.top_bar.show_status("🤔 Analyzing task type…")
+                    self.top_bar.show_status("Analyzing task type…")
                     self._current_assistant_widget = ChatMessageWidget("assistant", "")
                     self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
                     cw = self._classify_worker = ClassifyWorker(url, model, text, num_ctx, parent=self)
-                    cw.result_ready.connect(lambda task_type: self._on_classify_done(task_type, text, url, model, num_ctx))
+                    self._active_controller.bind_classify_worker(
+                        cw, (text, url, model, num_ctx)
+                    )
                     cw.finished.connect(cw.deleteLater)
                     cw.start()
 
@@ -957,18 +1462,15 @@ class ChatPage(QWidget):
     def _show_internet_blocked_error(self) -> None:
         """Show an inline error when Research is selected but internet is disabled."""
         err = (
-            "🌐 **Web Research is disabled.**\n\n"
+            "**Web Research is disabled.**\n\n"
             "Enable it in **Settings > Internet Access** to use Research mode.\n\n"
             "Ollambo is offline by default for privacy — web access is opt-in."
         )
-        if not self._current_assistant_widget:
-            self._current_assistant_widget = ChatMessageWidget("assistant", err)
-            self.history_layout.insertWidget(
-                self.history_layout.count() - 1, self._current_assistant_widget
-            )
-        else:
-            self._current_assistant_widget.set_content(err, is_final=True)
-        self._cleanup_workers_state()
+        self._active_controller.session.add_error(err)
+        if self._active_controller.view is not None:
+            self._active_controller.view.add_assistant(err)
+        self._on_controller_persist_needed(self._active_controller)
+        self._sync_active_controls()
 
     def _dispatch_research(self, question: str, url: str, model: str, num_ctx: int) -> None:
         """Launch ResearchWorker to draft research plan or run deep research."""
@@ -996,29 +1498,30 @@ class ChatPage(QWidget):
                     if decision == "continue":
                         stage = "continue"
                         project_id = self._research_project_id
-                        self._add_notice_row(f"🔬 Continuing research on **{proj.get('name', main_q)}**")
+                        self._add_notice_row(f"Continuing research on **{proj.get('name', main_q)}**")
                     else:
                         # new or ambiguous → start a fresh research project
                         self._research_project_id = None
-                        self._add_notice_row("🔬 Starting a new research project")
+                        self._add_notice_row("Starting a new research project")
             except Exception:
                 pass
 
-        self.top_bar.show_status(f"🔬 Deep Research ({depth.capitalize()}): drafting research plan…")
+        self.top_bar.show_status(f"Deep Research ({depth.capitalize()}): drafting research plan…")
 
         self._research_activity_log = [
-            "🌐 Web Access: ACTIVE (DuckDuckGo Live Search & Content Extraction)",
-            f"⚡ Preset: {depth.capitalize()} Depth",
-            "🧠 Drafting research plan and skeptic checklist with local LLM…",
+            "Web Access: ACTIVE (DuckDuckGo Live Search & Content Extraction)",
+            f"Preset: {depth.capitalize()} Depth",
+            "Drafting research plan and skeptic checklist with local LLM…",
         ]
 
         init_md = (
-            f"### 🔬 Deep Research: Initializing\n\n"
-            f"- **🌐 Web Access:** `ACTIVE` (DuckDuckGo Live Search & Content Extraction)\n"
-            f"- **⚡ Preset:** {depth.capitalize()}\n"
+            f"### Deep Research: Initializing\n\n"
+            f"- **Web Access:** `ACTIVE` (DuckDuckGo Live Search & Content Extraction)\n"
+            f"- **Preset:** {depth.capitalize()}\n"
             f"- **Status:** Drafting research plan, sub-questions, and skeptic checklist with local LLM…\n\n"
             f"*(Outlining research questions before querying DuckDuckGo)*"
         )
+        self._active_controller.session.draft_assistant = init_md
 
         if not self._current_assistant_widget:
             self._current_assistant_widget = ChatMessageWidget("assistant", init_md)
@@ -1043,14 +1546,16 @@ class ChatPage(QWidget):
             settings=self._settings,
             parent=self,
         )
-        rw.plan_ready.connect(self._on_research_plan_ready)
-        rw.progress.connect(self._on_research_progress_detailed)
-        rw.status_message.connect(self._on_research_progress)
-        rw.research_done.connect(self._on_research_finished)
-        rw.error.connect(self._on_worker_error)
+        controller = self._active_controller
+        controller.bind_research_worker(rw)
+        self._connect_for_controller(rw.plan_ready, controller, self._on_research_plan_ready)
+        self._connect_for_controller(rw.progress, controller, self._on_research_progress_detailed)
+        self._connect_for_controller(rw.status_message, controller, self._on_research_progress)
+        self._connect_for_controller(rw.research_done, controller, self._on_research_finished)
         rw.finished.connect(rw.deleteLater)
         rw.start()
         self._last_research_progress_time = time.monotonic()
+        self._on_controller_persist_needed(controller)
         self._start_research_heartbeat()
         self._scroll_to_bottom(force=True)
 
@@ -1058,6 +1563,7 @@ class ChatPage(QWidget):
     def _on_research_plan_ready(self, plan: Any, project_id: str) -> None:
         self._pending_research_plan = plan
         self._pending_research_project_id = project_id
+        self._active_controller.session.status = "idle"
         auto_approve = bool(self._settings.get("auto_approve_research_plans", False))
 
         self.research_plan_panel.set_plan(plan)
@@ -1071,55 +1577,53 @@ class ChatPage(QWidget):
         myths_str = ", ".join(myths) if myths else "Standard bias & empirical verification"
 
         if auto_approve:
-            self.top_bar.show_status("📋 Research plan approved — starting web search & execution…")
+            self.top_bar.show_status("Research plan approved — starting web search & execution…")
             msg = (
-                f"### 📋 Research Plan Drafted & Auto-Approved\n\n"
+                f"### Research Plan Drafted & Auto-Approved\n\n"
                 f"**Core Question:** {plan.main_question}\n\n"
                 f"**Sub-Questions Investigated ({len(plan.sub_questions)}):**\n{sq_bullets}\n\n"
                 f"- **Adversarial Skeptic Checklist:** {myths_str}\n\n"
-                f"🌐 *Web search and evidence collection in progress…*"
+                f"*Web search and evidence collection in progress…*"
             )
             if self._current_assistant_widget:
                 self._current_assistant_widget.set_content(msg, is_final=True)
+            self._active_controller.session.draft_assistant = msg
             self._scroll_to_bottom()
         else:
             self.plan_stack.setCurrentWidget(self.research_plan_panel)
-            self.top_bar.show_status("📋 Research plan ready — please review and approve.")
+            self.top_bar.show_status("Research plan ready — please review and approve.")
 
             msg = (
-                f"### 📋 Proposed Research Plan\n\n"
+                f"### Proposed Research Plan\n\n"
                 f"**Core Question:** {plan.main_question}\n\n"
                 f"**Sub-Questions to Investigate ({len(plan.sub_questions)}):**\n{sq_bullets}\n\n"
                 f"- **Adversarial Skeptic Checklist:** {myths_str}\n\n"
-                f"Click **🚀 Approve & Start Deep Research Now** below to begin, or open the **📋 Plan** tab to customize sub-questions."
+                f"Click **Approve & Start Deep Research Now** below to begin, or open the **Plan** tab to customize sub-questions."
             )
             if self._current_assistant_widget:
                 self._current_assistant_widget.set_content(msg, is_final=True)
+            self._active_controller.session.draft_assistant = None
+            self._active_controller.view.streaming_widget = None
 
             btn_box = QWidget()
             btn_layout = QHBoxLayout(btn_box)
             btn_layout.setContentsMargins(0, 4, 0, 4)
             btn_layout.setSpacing(8)
 
-            btn_approve = QPushButton("🚀 Approve & Start Deep Research Now")
-            btn_approve.setStyleSheet(
-                "QPushButton { background-color: #98c379; color: #1e1e1e; font-weight: bold; font-size: 13px; padding: 8px 18px; border-radius: 5px; }"
-                "QPushButton:hover { background-color: #87b368; }"
-            )
-            btn_edit = QPushButton("✏️ Edit in Plan Tab")
-            btn_edit.setStyleSheet(
-                "QPushButton { background-color: #2c313a; color: #abb2bf; padding: 8px 14px; border-radius: 5px; border: 1px solid #3e4451; }"
-                "QPushButton:hover { background-color: #353b45; color: #dcdcdc; }"
-            )
+            btn_approve = QPushButton("Approve & Start Deep Research Now")
+            btn_approve.setIcon(icon("arrow-up"))
+            set_variant(btn_approve, "primary")
+            btn_edit = QPushButton("Edit in Plan tab")
+            btn_edit.setIcon(icon("pencil"))
 
             def _start_approved():
                 btn_approve.setEnabled(False)
                 btn_edit.setEnabled(False)
-                btn_approve.setText("⏳ Deep Research Running…")
+                btn_approve.setText("Deep Research running…")
                 self._on_research_plan_approved(plan)
 
             btn_approve.clicked.connect(_start_approved)
-            btn_edit.clicked.connect(lambda: self.tabs.setCurrentWidget(self.plan_stack))
+            btn_edit.clicked.connect(self._show_plan)
 
             btn_layout.addWidget(btn_approve)
             btn_layout.addWidget(btn_edit)
@@ -1131,7 +1635,7 @@ class ChatPage(QWidget):
             self._scroll_to_bottom(force=True)
 
     def _on_research_plan_approved(self, approved_plan: Any) -> None:
-        self.tabs.setCurrentIndex(0)
+        self.navigation.show_chat()
         depth = self.top_bar.research_depth()
         url = getattr(self, "_pending_research_url", "http://localhost:11434")
         model = getattr(self, "_pending_research_model", self.top_bar.current_model())
@@ -1139,20 +1643,20 @@ class ChatPage(QWidget):
         topic = getattr(self, "_pending_research_topic", "")
         pid = getattr(self, "_pending_research_project_id", "")
 
-        self.top_bar.show_status("🔬 Starting deep research execution…")
+        self.top_bar.show_status("Starting deep research execution…")
         self._research_activity_log = [
-            "🌐 Web Access: ACTIVE (DuckDuckGo Live Search & Content Extraction)",
-            f"⚡ Depth: {depth.capitalize()}",
-            "🚀 Research plan approved — launching investigative engine…",
+            "Web Access: ACTIVE (DuckDuckGo Live Search & Content Extraction)",
+            f"Depth: {depth.capitalize()}",
+            "Research plan approved — launching investigative engine…",
         ]
 
         start_md = (
-            f"### 🔬 Deep Research: Starting Execution\n\n"
-            f"- **🌐 Web Access:** `ACTIVE` (DuckDuckGo Live Search & Content Extraction)\n"
-            f"- **⚡ Depth:** {depth.capitalize()}\n"
+            f"### Deep Research: Starting execution\n\n"
+            f"- **Web Access:** `ACTIVE` (DuckDuckGo Live Search & Content Extraction)\n"
+            f"- **Depth:** {depth.capitalize()}\n"
             f"- **Status:** Launching investigative engine and DuckDuckGo queries…\n\n"
-            f"#### 📋 Live Activity Feed:\n"
-            f"- 🌐 Initializing web search queries across {len(approved_plan.sub_questions)} sub-questions\n"
+            f"#### Live Activity Feed:\n"
+            f"- Initializing web search queries across {len(approved_plan.sub_questions)} sub-questions\n"
         )
         if not self._current_assistant_widget:
             self._current_assistant_widget = ChatMessageWidget("assistant", start_md)
@@ -1172,13 +1676,15 @@ class ChatPage(QWidget):
             settings=self._settings,
             parent=self,
         )
-        rw.progress.connect(self._on_research_progress_detailed)
-        rw.status_message.connect(self._on_research_progress)
-        rw.research_done.connect(self._on_research_finished)
-        rw.error.connect(self._on_worker_error)
+        controller = self._active_controller
+        controller.bind_research_worker(rw)
+        self._connect_for_controller(rw.progress, controller, self._on_research_progress_detailed)
+        self._connect_for_controller(rw.status_message, controller, self._on_research_progress)
+        self._connect_for_controller(rw.research_done, controller, self._on_research_finished)
         rw.finished.connect(rw.deleteLater)
         rw.start()
         self._last_research_progress_time = time.monotonic()
+        self._on_controller_persist_needed(controller)
         self._start_research_heartbeat()
         self._scroll_to_bottom(force=True)
 
@@ -1186,7 +1692,8 @@ class ChatPage(QWidget):
     def _on_research_progress_detailed(self, phase: str, step: int, total: int, msg: str, eta: str) -> None:
         self.top_bar.notify_activity()
         self._last_research_progress_time = time.monotonic()
-        self.research_panel.update_active_step(phase, step, total, msg)
+        clean_msg, _ = strip_emoji_prefix(msg)
+        self.research_panel.update_active_step(phase, step, total, clean_msg)
 
         # Compute ONE overall percentage across phases
         total_sqs = total if total > 0 else 1
@@ -1213,31 +1720,32 @@ class ChatPage(QWidget):
 
         eta_suffix = f" • {eta}" if eta else ""
         stage_prefix = f"Stage {stage_num} of 5 - {phase}" if stage_num else phase
-        self.top_bar.show_status(f"🔬 {stage_prefix} [{step}/{total}]: {msg}{eta_suffix}", pct)
+        self.top_bar.show_status(f"{stage_prefix} [{step}/{total}]: {clean_msg}{eta_suffix}", pct)
 
         if not hasattr(self, "_research_activity_log") or self._research_activity_log is None:
             self._research_activity_log = []
 
-        if msg:
-            is_dup = any(msg in entry for entry in self._research_activity_log[-30:])
+        if clean_msg:
+            is_dup = any(clean_msg in entry for entry in self._research_activity_log[-30:])
             if not is_dup:
                 import datetime as _dt
                 ts = _dt.datetime.now().strftime("%H:%M:%S")
-                self._research_activity_log.append(f"[{ts}] {msg}")
+                self._research_activity_log.append(f"[{ts}] {clean_msg}")
 
         depth = self.top_bar.research_depth().capitalize()
         recent_logs = self._research_activity_log[-8:]
         log_lines = "\n".join(f"- {line}" for line in recent_logs)
 
         card_md = (
-            f"### 🔬 Deep Research: {stage_prefix} [{step}/{total}]\n\n"
-            f"- **🌐 Web Access:** `ACTIVE` (DuckDuckGo Live Search & Content Extraction)\n"
-            f"- **⚡ Depth:** {depth}\n"
-            f"- **⏱️ Progress:** Step {step} of {total}{eta_suffix}\n"
-            f"- **Current Action:** {msg}\n\n"
-            f"#### 📋 Live Activity Feed:\n"
+            f"### Deep Research: {stage_prefix} [{step}/{total}]\n\n"
+            f"- **Web Access:** `ACTIVE` (DuckDuckGo Live Search & Content Extraction)\n"
+            f"- **Depth:** {depth}\n"
+            f"- **Progress:** Step {step} of {total}{eta_suffix}\n"
+            f"- **Current Action:** {clean_msg}\n\n"
+            f"#### Live Activity Feed:\n"
             f"{log_lines}"
         )
+        self._active_controller.session.draft_assistant = card_md
         if self._current_assistant_widget:
             self._current_assistant_widget.set_content(card_md, is_final=True)
             self._scroll_to_bottom()
@@ -1248,17 +1756,18 @@ class ChatPage(QWidget):
         # Don't overwrite progress bar with indeterminate status if detailed progress arrived recently
         now = time.monotonic()
         last = getattr(self, "_last_research_progress_time", 0)
+        clean_msg, _ = strip_emoji_prefix(msg)
         if now - last < 2.0:
             pass  # skip show_status to preserve percentage in top bar
         else:
-            self.top_bar.show_status(msg)
+            self.top_bar.show_status(clean_msg)
         if hasattr(self, "_research_activity_log") and self._research_activity_log is not None:
-            if msg:
-                is_dup = any(msg in entry for entry in self._research_activity_log[-30:])
+            if clean_msg:
+                is_dup = any(clean_msg in entry for entry in self._research_activity_log[-30:])
                 if not is_dup:
                     import datetime as _dt
                     ts = _dt.datetime.now().strftime("%H:%M:%S")
-                    self._research_activity_log.append(f"[{ts}] {msg}")
+                    self._research_activity_log.append(f"[{ts}] {clean_msg}")
 
     # ── Research Heartbeat Timer ───────────────────────────────────────
 
@@ -1274,20 +1783,25 @@ class ChatPage(QWidget):
 
     def _stop_research_heartbeat(self) -> None:
         """Stop the research heartbeat timer."""
-        if hasattr(self, "_research_heartbeat_timer") and self._research_heartbeat_timer.isActive():
+        still_running = any(
+            worker_is_running(controller.research_worker)
+            for controller in self._controllers.values()
+        )
+        if not still_running and hasattr(self, "_research_heartbeat_timer"):
             self._research_heartbeat_timer.stop()
 
     def _on_heartbeat_tick(self) -> None:
         """Update elapsed time in status bar; show 'still working' if stale."""
-        if not self._active_research_worker:
+        controller = self._controllers.get(self._current_chat_id)
+        if controller is None or not worker_is_running(controller.research_worker):
             self._stop_research_heartbeat()
             return
-        elapsed = time.monotonic() - getattr(self, "_research_start_mono", time.monotonic())
+        elapsed = time.monotonic() - controller.session.research_start_mono
         mm = int(elapsed) // 60
         ss = int(elapsed) % 60
         elapsed_str = f"{mm:02d}:{ss:02d}"
 
-        last_prog = getattr(self, "_last_research_progress_time", 0)
+        last_prog = controller.session.last_research_progress_time
         stale = (time.monotonic() - last_prog) > 5.0 if last_prog else False
 
         current_status = self.top_bar.lbl_status.text()
@@ -1306,6 +1820,8 @@ class ChatPage(QWidget):
         self._stop_research_heartbeat()
         self.top_bar.set_idle()
         self.research_panel.refresh()
+        self._active_controller.session.status = "idle"
+        self._active_controller.session.draft_assistant = None
 
         # Track this as the chat's active research project for continue-or-new routing
         self._research_project_id = project_id
@@ -1317,30 +1833,33 @@ class ChatPage(QWidget):
         sources_cnt = proj.get("source_count", 0)
 
         finish_msg = (
-            f"### 🔬 Deep Research Complete: {title}\n\n"
-            f"- **🌐 Web Access:** Completed\n"
+            f"### Deep Research complete: {title}\n\n"
+            f"- **Web Access:** Completed\n"
             f"- **Sources evaluated & verified:** {sources_cnt}\n"
             f"- **Report sections:** 11 sections including Executive Summary, Key Findings, "
             f"Disputed Claims, Mermaid Diagram, Glossary, and Learning Aids.\n"
             f"- **Saved to:** Research Library tab\n"
         )
         if self._current_assistant_widget:
-            self._current_assistant_widget.set_content(finish_msg, is_final=True)
+            if self._active_controller.view is not None:
+                self._active_controller.view.finish_stream(finish_msg)
+            else:
+                self._current_assistant_widget.set_content(finish_msg, is_final=True)
+                self._current_assistant_widget = None
 
         # Action button to view report
-        btn_open = QPushButton("📖 Open Report in Research Library")
-        btn_open.setStyleSheet(
-            "QPushButton { background-color: #61afef; color: #1e1e1e; font-weight: bold; padding: 6px 14px; border-radius: 4px; }"
-            "QPushButton:hover { background-color: #529fd8; }"
+        btn_open = QPushButton("Open report in Research Library")
+        btn_open.setIcon(icon("file"))
+        set_variant(btn_open, "primary")
+        btn_open.clicked.connect(
+            lambda: (self.navigation.show_library(), self.research_panel.open_report(project_id))
         )
-        btn_open.clicked.connect(lambda: (self.tabs.setCurrentWidget(self.research_panel), self.research_panel.open_report(project_id)))
         self.history_layout.insertWidget(self.history_layout.count() - 1, btn_open)
 
         self._messages.append({"role": "assistant", "content": finish_msg})
         self._update_token_meter()
         self.top_bar.hide_status()
         self._save_current_conversation()
-        self._active_research_worker = None
         self._cleanup_workers_state()
         self._add_retry_button()
 
@@ -1349,17 +1868,17 @@ class ChatPage(QWidget):
         url = self._settings.get("ollama_url", "http://localhost:11434")
         model = self.top_bar.current_model()
         num_ctx = getattr(self, "_active_num_ctx", int(self._settings.get("num_ctx", 8192)))
-        self.tabs.setCurrentIndex(0)
-        self.top_bar.show_status("🔬 Resuming research from checkpoint…")
+        self.navigation.show_chat()
+        self.top_bar.show_status("Resuming research from checkpoint…")
 
         self._research_activity_log = [
-            "🌐 Web Access: ACTIVE (DuckDuckGo Live Search & Content Extraction)",
-            "🔄 Resuming research project from saved checkpoint…",
+            "Web Access: ACTIVE (DuckDuckGo Live Search & Content Extraction)",
+            "Resuming research project from saved checkpoint…",
         ]
 
         resume_md = (
-            f"### 🔬 Deep Research: Resuming\n\n"
-            f"- **🌐 Web Access:** `ACTIVE` (DuckDuckGo Live Search & Content Extraction)\n"
+            f"### Deep Research: Resuming\n\n"
+            f"- **Web Access:** `ACTIVE` (DuckDuckGo Live Search & Content Extraction)\n"
             f"- **Status:** Rehydrating sources, ledger, and notes from checkpoint…\n"
         )
 
@@ -1378,13 +1897,15 @@ class ChatPage(QWidget):
             settings=self._settings,
             parent=self,
         )
-        rw.progress.connect(self._on_research_progress_detailed)
-        rw.status_message.connect(self._on_research_progress)
-        rw.research_done.connect(self._on_research_finished)
-        rw.error.connect(self._on_worker_error)
+        controller = self._active_controller
+        controller.bind_research_worker(rw)
+        self._connect_for_controller(rw.progress, controller, self._on_research_progress_detailed)
+        self._connect_for_controller(rw.status_message, controller, self._on_research_progress)
+        self._connect_for_controller(rw.research_done, controller, self._on_research_finished)
         rw.finished.connect(rw.deleteLater)
         rw.start()
         self._last_research_progress_time = time.monotonic()
+        self._on_controller_persist_needed(controller)
         self._start_research_heartbeat()
         self._scroll_to_bottom(force=True)
 
@@ -1426,14 +1947,12 @@ class ChatPage(QWidget):
         """Launch PlanWorker (used after project routing is resolved)."""
         if task_type == "code":
             w = self._active_plan_worker = PlanWorker(url, model, text, num_ctx, existing_context=existing_context, parent=self)
-            w.plan_ready.connect(self._on_plan_ready)
-            w.plan_error.connect(self._on_worker_error)
+            self._active_controller.bind_plan_worker(w)
             w.finished.connect(w.deleteLater)
             w.start()
         else:  # both
             pw = self._active_plan_worker = PlanWorker(url, model, text, num_ctx, existing_context=existing_context, parent=self)
-            pw.plan_ready.connect(self._on_hybrid_plan_ready)
-            pw.plan_error.connect(lambda err: None)
+            self._active_controller.bind_plan_worker(pw, hybrid=True)
             pw.finished.connect(pw.deleteLater)
             pw.start()
 
@@ -1451,10 +1970,11 @@ class ChatPage(QWidget):
 
         if decision == "ambiguous":
             # Run LLM routing off the GUI thread
-            self.top_bar.show_status("🤔 Deciding whether to continue or start a new project…")
+            self.top_bar.show_status("Deciding whether to continue or start a new project…")
             rw = self._route_worker = RouteWorker(url, model, text, ws_summary, num_ctx, parent=self)
-            rw.result_ready.connect(
-                lambda d: self._on_route_resolved(d, task_type, text, url, model, num_ctx, ws_summary)
+            controller = self._active_controller
+            controller.bind_route_worker(
+                rw, (task_type, text, url, model, num_ctx, ws_summary)
             )
             rw.finished.connect(rw.deleteLater)
             rw.start()
@@ -1476,46 +1996,40 @@ class ChatPage(QWidget):
         self._is_hybrid_mode = (task_type == "both")
 
         if task_type == "code":
-            self.top_bar.show_status("🧠 Architect model is analyzing task…")
+            self.top_bar.show_status("Architect model is analyzing task…")
             if not self._current_assistant_widget:
-                self._current_assistant_widget = ChatMessageWidget("assistant", "🧠 Analyzing request & planning project…")
+                self._current_assistant_widget = ChatMessageWidget("assistant", "Analyzing request & planning project…")
                 self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
             else:
-                self._current_assistant_widget.set_content("🧠 Analyzing request & planning project…")
+                self._current_assistant_widget.set_content("Analyzing request & planning project…")
             self._route_and_plan("code", text, url, model, num_ctx)
         elif task_type == "both":
             is_low_power = bool(self._settings.get("low_power_mode", False))
             extra_sys = getattr(self, "_last_extra_system", "")
             if is_low_power:
-                self.top_bar.show_status("💬 Replying in chat (low-power: planning will run next)…")
+                self.top_bar.show_status("Replying in chat (low-power: planning will run next)…")
                 if not self._current_assistant_widget:
                     self._current_assistant_widget = ChatMessageWidget("assistant", "")
                     self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
                 cw = self._active_chat_worker = ChatWorker(
-                    url, model, list(self._messages), {"num_ctx": num_ctx, "low_power_mode": True},
+                    url, model, self._active_controller.session.model_messages(), {"num_ctx": num_ctx, "low_power_mode": True},
                     self._settings.get("summarizer_model", ""), extra_system=extra_sys, parent=self,
                 )
-                cw.token_received.connect(self._on_token_received)
-                cw.compaction_started.connect(self._on_compaction_started)
-                cw.compaction_performed.connect(self._on_compaction_performed)
-                cw.chat_finished.connect(lambda full, meta: self._start_sequential_plan(url, model, text, num_ctx, full, meta))
-                cw.chat_error.connect(self._on_worker_error)
+                controller = self._active_controller
+                controller.session.sequential_plan_args = (url, model, text, num_ctx)
+                controller.bind_chat_worker(cw)
                 cw.finished.connect(cw.deleteLater)
                 cw.start()
             else:
-                self.top_bar.show_status("💬 Explaining in chat & 🧠 planning project…")
+                self.top_bar.show_status("Explaining in chat and planning project…")
                 if not self._current_assistant_widget:
                     self._current_assistant_widget = ChatMessageWidget("assistant", "")
                     self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
                 cw = self._active_chat_worker = ChatWorker(
-                    url, model, list(self._messages), {"num_ctx": num_ctx},
+                    url, model, self._active_controller.session.model_messages(), {"num_ctx": num_ctx},
                     self._settings.get("summarizer_model", ""), extra_system=extra_sys, parent=self,
                 )
-                cw.token_received.connect(self._on_token_received)
-                cw.compaction_started.connect(self._on_compaction_started)
-                cw.compaction_performed.connect(self._on_compaction_performed)
-                cw.chat_finished.connect(self._on_chat_finished)
-                cw.chat_error.connect(self._on_worker_error)
+                self._active_controller.bind_chat_worker(cw)
                 cw.finished.connect(cw.deleteLater)
                 cw.start()
 
@@ -1523,26 +2037,21 @@ class ChatPage(QWidget):
         else:
             extra_sys = getattr(self, "_last_extra_system", "")
             if not is_compaction_needed(estimate_messages_tokens(self._messages), num_ctx, threshold_ratio=0.75):
-                self.top_bar.show_status("💬 Connecting to local model…")
+                self.top_bar.show_status("Connecting to local model…")
             if not self._current_assistant_widget:
                 self._current_assistant_widget = ChatMessageWidget("assistant", "")
                 self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
             cw = self._active_chat_worker = ChatWorker(
-                url, model, list(self._messages), {"num_ctx": num_ctx},
+                url, model, self._active_controller.session.model_messages(), {"num_ctx": num_ctx},
                 self._settings.get("summarizer_model", ""), extra_system=extra_sys, parent=self,
             )
-            cw.token_received.connect(self._on_token_received)
-            cw.compaction_started.connect(self._on_compaction_started)
-            cw.compaction_performed.connect(self._on_compaction_performed)
-            cw.chat_finished.connect(self._on_chat_finished)
-            cw.chat_error.connect(self._on_worker_error)
+            self._active_controller.bind_chat_worker(cw)
             cw.finished.connect(cw.deleteLater)
             cw.start()
 
     def _start_sequential_plan(self, url: str, model: str, text: str, num_ctx: int, full_chat: str, meta: dict) -> None:
         """Run planner sequentially after chat reply finishes in low power mode."""
-        self._on_chat_finished(full_chat, meta)
-        self.top_bar.show_status("🧠 Low-power mode: planning project…")
+        self.top_bar.show_status("Low-power mode: planning project…")
         self._route_and_plan("both", text, url, model, num_ctx)
 
     @Slot(object)
@@ -1550,22 +2059,23 @@ class ChatPage(QWidget):
         self.top_bar.notify_activity()
         self._active_plan = plan
         self.plan_panel.set_plan(plan)
+        self._show_plan()
         self.plan_panel.btn_approve.setText("Approve & Start Coding")
         self.plan_panel.btn_approve.setEnabled(True)
         if getattr(self, "_is_hybrid_mode", False) and self._current_assistant_widget:
             footer = (
-                f"\n\n---\n### 📋 Project Plan Ready: {plan.goal} ({len(plan.steps)} steps)\n\n"
+                f"\n\n---\n### Project Plan Ready: {plan.goal} ({len(plan.steps)} steps)\n\n"
                 + "\n".join(f"- **Step {s.step}**: {s.description} → `{s.file}`" for s in plan.steps)
-                + "\n\n👉 A complete project plan has been prepared in the **📋 Plan** tab! Switch to the Plan tab and click **Approve & Start Coding** whenever you're ready to build."
+                + "\n\nA complete project plan has been prepared in the **Plan** tab! Switch to the Plan tab and click **Approve & Start Coding** whenever you're ready to build."
             )
             curr = self._current_assistant_widget.get_content()
-            if "📋 Project Plan Ready" not in curr:
+            if "Project Plan Ready" not in curr:
                 updated = curr + footer
                 self._current_assistant_widget.set_content(updated, is_final=True)
                 if self._messages and self._messages[-1].get("role") == "assistant":
                     self._messages[-1]["content"] = updated
             self._is_hybrid_mode = False
-        self.top_bar.show_status(f"💬 Answer ready & 📋 Project plan prepared ({len(plan.steps)} steps) in Plan tab", 100)
+        self.top_bar.show_status(f"Answer ready; project plan prepared ({len(plan.steps)} steps) in Plan tab", 100)
         self._save_current_conversation()
 
     @Slot(object)
@@ -1576,15 +2086,17 @@ class ChatPage(QWidget):
         self.plan_panel.btn_approve.setText("Approve & Start Coding")
         self.plan_panel.btn_approve.setEnabled(True)
         self.plan_stack.setCurrentWidget(self.plan_panel)
-        self.tabs.setCurrentIndex(1)
-        self.top_bar.show_status(f"📋 Plan ready ({len(plan.steps)} steps) — review in Plan tab", 100)
+        self._show_plan()
+        self.top_bar.show_status(f"Plan ready ({len(plan.steps)} steps) — review in Plan tab", 100)
         plan_msg = (
-            f"📋 **Plan Ready: {plan.goal}** ({len(plan.steps)} steps)\n\n"
+            f"**Plan Ready: {plan.goal}** ({len(plan.steps)} steps)\n\n"
             + "\n".join(f"  {s.step}. {s.description} → `{s.file}`" for s in plan.steps)
-            + "\n\n👉 Review the plan in the **📋 Plan** tab and click **Approve & Start Coding** to begin building."
+            + "\n\nReview the plan in the **Plan** tab and click **Approve & Start Coding** to begin building."
         )
         if self._current_assistant_widget:
             self._current_assistant_widget.set_content(plan_msg)
+        if self._active_controller.view is not None:
+            self._active_controller.view.streaming_widget = None
         self._messages.append({"role": "assistant", "content": plan_msg})
         self._save_current_conversation()
         self._cleanup_workers_state()
@@ -1621,7 +2133,7 @@ class ChatPage(QWidget):
                     workspace._update_index_entry(old_workspace_id, status="saved")
                 except Exception:
                     pass
-                self._add_notice_row(f"💾 Previous build saved as **{old_name}**")
+                self._add_notice_row(f"Previous build saved as **{old_name}**")
 
             # Create a fresh workspace
             name = plan.project_name or workspace.slugify(plan.goal)
@@ -1633,7 +2145,7 @@ class ChatPage(QWidget):
             self._build_files = {}
             self._active_plan = None
             self.artifacts_panel.clear()
-            self._add_notice_row(f"🚀 Started a new project **{name}**")
+            self._add_notice_row(f"Started a new project **{name}**")
         else:  # continue
             ws_id = target.get("workspace_id") or self._workspace_id
             self._workspace_id = ws_id
@@ -1646,14 +2158,17 @@ class ChatPage(QWidget):
                 self.artifacts_panel.clear()
                 for fn, content in existing_files.items():
                     self.artifacts_panel.add_file(fn, content)
-                self._add_notice_row(f"📂 Continuing in project **{ws_name}**")
+                self._add_notice_row(f"Continuing in project **{ws_name}**")
 
         self._building_files = dict(self._build_files)
+        self._building_workspace_id = self._workspace_id
+        self._active_controller.session.status = "building"
+        self._update_sidebar_session(self._current_chat_id)
 
         self.plan_panel.btn_approve.setText("Building in Progress…")
         self.plan_panel.btn_approve.setEnabled(False)
-        self.tabs.setCurrentIndex(2)
-        self.btn_stop.setEnabled(True)
+        self._show_files()
+        self.composer.set_generating(True)
 
         # Resume step: only when the SAME plan already has completed steps
         same_plan_has_completed = bool(self._active_plan and self._active_plan is plan and any(s.completed for s in plan.steps))
@@ -1662,10 +2177,16 @@ class ChatPage(QWidget):
         total = len(plan.steps)
         label = plan.steps[start - 1].file if start <= total else "?"
         action = "Resuming" if start > 1 else "Starting"
-        self.top_bar.show_status(f"⚙️ {action} [{start}/{total}] {label}…", 0)
+        self.top_bar.show_status(f"{action} [{start}/{total}] {label}…", 0)
 
         self.sidebar.show_wip(self._building_chat_id)
-        save_session(self._building_chat_id, plan, self._building_files, start, workspace_id=self._workspace_id)
+        save_session(
+            self._building_chat_id,
+            plan,
+            self._building_files,
+            start,
+            workspace_id=self._building_workspace_id,
+        )
         self._save_current_conversation()
 
         is_lp = bool(self._settings.get("low_power_mode", False))
@@ -1692,32 +2213,43 @@ class ChatPage(QWidget):
         w.file_completed.connect(self._on_file_checkpoint)
         w.all_completed.connect(self._on_all_files_completed)
         w.worker_error.connect(self._on_build_error)
+        w.finished.connect(partial(self._on_code_worker_finished, w))
         w.finished.connect(w.deleteLater)
         w.start()
 
+    def _on_code_worker_finished(self, worker: CodeWorker) -> None:
+        if self._active_code_worker is worker:
+            self._active_code_worker = None
+
     def _on_step_started(self, step_num: int, filename: str, total: int) -> None:
-        self.top_bar.notify_activity()
         if self._current_chat_id == self._building_chat_id:
+            self.top_bar.notify_activity()
             pct = int(((step_num - 1) / total) * 100) if total else 0
-            self.top_bar.show_status(f"⚙️ [{step_num}/{total}] Writing {filename}…", pct)
+            self.top_bar.show_status(f"[{step_num}/{total}] Writing {filename}…", pct)
 
     def _on_part_started(self, filename: str, part: int, max_parts: int) -> None:
-        self.top_bar.notify_activity()
         if self._current_chat_id == self._building_chat_id:
+            self.top_bar.notify_activity()
             self.artifacts_panel.show_continuation_progress(filename, part, max_parts)
-            self.top_bar.show_status(f"⚡ Continuing {filename} ({part}/{max_parts})…")
+            self.top_bar.show_status(f"Continuing {filename} ({part}/{max_parts})…")
 
     def _on_test_progress(self, filename: str, msg: str) -> None:
-        self.top_bar.notify_activity()
         if self._current_chat_id == self._building_chat_id:
+            self.top_bar.notify_activity()
             self.top_bar.show_status(msg)
             self.artifacts_panel.show_test_status(filename, msg)
 
     @Slot(str, str, int)
     def _on_file_checkpoint(self, filename: str, code: str, step_num: int) -> None:
-        self.top_bar.notify_activity()
         target_id = self._building_chat_id or self._current_chat_id
+        if target_id in self._deleted_chat_ids:
+            return
+        if self._current_chat_id == target_id:
+            self.top_bar.notify_activity()
         self._building_files[filename] = code
+        target_controller = self._controllers.get(target_id)
+        if target_controller:
+            target_controller.session.build_files[filename] = code
 
         # Persist session (plan state + next step + workspace_id) - NO full chat reload per file
         if self._building_plan:
@@ -1726,7 +2258,7 @@ class ChatPage(QWidget):
                     s.completed = True
             save_session(
                 target_id, self._building_plan, self._building_files, step_num + 1,
-                workspace_id=self._workspace_id,
+                workspace_id=self._building_workspace_id,
             )
 
         # Update UI if user is actively viewing the building chat
@@ -1736,69 +2268,110 @@ class ChatPage(QWidget):
             self.plan_panel.mark_step_completed(step_num)
             total = len(self._building_plan.steps) if self._building_plan else 1
             pct = int((step_num / total) * 100) if total else 0
-            self.top_bar.show_status(f"✅ {filename} ({step_num}/{total})", pct)
+            self.top_bar.show_status(f"{filename} ({step_num}/{total})", pct)
 
     @Slot(dict)
     def _on_all_files_completed(self, files: dict[str, str]) -> None:
-        self.top_bar.set_idle()
         target_id = self._building_chat_id or self._current_chat_id
+        if target_id in self._deleted_chat_ids:
+            self._build_running = False
+            if self._current_chat_id == target_id:
+                self.top_bar.set_idle()
+            self._building_chat_id = None
+            self._building_plan = None
+            self._building_files = {}
+            self._building_workspace_id = None
+            self._deleted_chat_ids.discard(target_id)
+            return
         self._build_running = False
 
         complete_session(target_id)
         self.sidebar.hide_wip()
 
         # Prefer files from the workspace on disk (source of truth)
-        ws_files = workspace.read_all(self._workspace_id) if self._workspace_id else files
+        ws_id = self._building_workspace_id
+        ws_files = workspace.read_all(ws_id) if ws_id else files
         summary = generate_project_walkthrough(self._building_plan or self._active_plan, ws_files)
 
         # Include project folder path in the summary
-        if self._workspace_id:
-            wp = workspace.workspace_path(self._workspace_id)
+        if ws_id:
+            wp = workspace.workspace_path(ws_id)
             if wp:
-                summary = f"{summary}\n\n📁 **Project folder:** `{wp}`"
+                summary = f"{summary}\n\n**Project folder:** `{wp}`"
 
-        c_data = load_chat(target_id)
-        if c_data:
+        target_controller = self._controllers.get(target_id)
+        if target_controller:
+            target_controller.session.messages.append({"role": "assistant", "content": summary})
+            target_controller.session.workspace_id = ws_id
+            target_controller.session.build_files = dict(ws_files)
+            target_controller.session.status = "idle"
+            if target_controller.view is not None and target_id != self._current_chat_id:
+                target_controller.view.add_assistant(summary)
+            target_controller.mark_unread_if_hidden()
+            self._on_controller_persist_needed(target_controller)
+        elif c_data := load_chat(target_id):
             c_data.setdefault("messages", []).append({"role": "assistant", "content": summary})
-            # Stop storing file contents in chat JSON; store workspace_id instead
             c_data["artifacts"] = {}
-            c_data["workspace_id"] = self._workspace_id
+            c_data["workspace_id"] = ws_id
             save_chat(c_data)
 
         if self._current_chat_id == target_id:
-            self._messages.append({"role": "assistant", "content": summary})
             self.history_layout.insertWidget(self.history_layout.count() - 1, ChatMessageWidget("assistant", summary))
-            self.top_bar.show_status(f"✅ All {len(ws_files)} files completed! Walkthrough generated.", 100)
+            self.top_bar.set_idle()
+            self.top_bar.show_status(f"All {len(ws_files)} files completed. Walkthrough generated.", 100)
             QTimer.singleShot(4000, self.top_bar.hide_status)
-            self.plan_panel.btn_approve.setText("✅ Build Completed")
+            self.plan_panel.btn_approve.setText("Build completed")
             self.plan_panel.btn_approve.setEnabled(False)
             self._add_retry_button()
 
         self._building_chat_id = None
         self._building_plan = None
         self._building_files = {}
-        self._active_code_worker = None
-        self.btn_stop.setEnabled(False)
+        self._building_workspace_id = None
+        self._deleted_chat_ids.discard(target_id)
+        self._sync_active_controls()
 
     @Slot(str)
     def _on_build_error(self, err_msg: str) -> None:
-        self.top_bar.set_idle()
         target_id = self._building_chat_id or self._current_chat_id
+        if target_id in self._deleted_chat_ids:
+            self._build_running = False
+            if self._current_chat_id == target_id:
+                self.top_bar.set_idle()
+            self._building_chat_id = None
+            self._building_plan = None
+            self._building_files = {}
+            self._building_workspace_id = None
+            self._deleted_chat_ids.discard(target_id)
+            return
         self._build_running = False
 
-        err = f"⚠️ Build error: {err_msg}\nProgress saved — click **Resume Building** in Plan tab."
-        c_data = load_chat(target_id)
-        if c_data:
+        err = f"Build error: {err_msg}\nProgress saved — click **Resume Building** in Plan tab."
+        target_controller = self._controllers.get(target_id)
+        if target_controller:
+            target_controller.session.messages.append({"role": "assistant", "content": err, "error": True})
+            target_controller.session.status = "idle"
+            if target_controller.view is not None and target_id != self._current_chat_id:
+                target_controller.view.add_assistant(err)
+            target_controller.mark_unread_if_hidden()
+            self._on_controller_persist_needed(target_controller)
+        elif c_data := load_chat(target_id):
             c_data.setdefault("messages", []).append({"role": "assistant", "content": err})
             save_chat(c_data)
 
         if self._building_plan:
-            save_session(target_id, self._building_plan, self._building_files, get_resume_step(self._building_plan))
+            save_session(
+                target_id,
+                self._building_plan,
+                self._building_files,
+                get_resume_step(self._building_plan),
+                workspace_id=self._building_workspace_id,
+            )
             self.sidebar.show_wip(target_id)
 
         if self._current_chat_id == target_id:
-            self._messages.append({"role": "assistant", "content": err})
             self.history_layout.insertWidget(self.history_layout.count() - 1, ChatMessageWidget("assistant", err))
+            self.top_bar.set_idle()
             self.top_bar.hide_status()
             if self._active_plan:
                 self.plan_panel.btn_approve.setText("▶ Resume Building")
@@ -1808,16 +2381,12 @@ class ChatPage(QWidget):
         self._building_chat_id = None
         self._building_plan = None
         self._building_files = {}
-        self._active_code_worker = None
-        self.btn_stop.setEnabled(False)
+        self._building_workspace_id = None
+        self._sync_active_controls()
 
     @Slot(str)
     def _on_token_received(self, token: str) -> None:
-        self.top_bar.notify_activity()
-        self._current_assistant_text.append(token)
-        self._pending_stream_dirty = True
-        if not self._stream_flush_timer.isActive():
-            self._stream_flush_timer.start()
+        self._active_controller.on_token(token)
 
     def _flush_stream_ui(self) -> None:
         """Render batched tokens smoothly at ~40fps without UI stutter."""
@@ -1826,7 +2395,7 @@ class ChatPage(QWidget):
         self._pending_stream_dirty = False
         if self._current_assistant_widget:
             self._current_assistant_widget.set_content("".join(self._current_assistant_text), is_final=False)
-        self.top_bar.show_status(f"💬 Generating ({len(self._current_assistant_text)} tokens)…")
+        self.top_bar.show_status(f"Generating ({len(self._current_assistant_text)} tokens)…")
         # Use debounced scroll instead of direct call to avoid layout thrashing
         if not self._scroll_timer.isActive():
             self._scroll_timer.start()
@@ -1835,184 +2404,110 @@ class ChatPage(QWidget):
     def _on_compaction_started(self, current_tok: int, threshold_tok: int) -> None:
         """Show compaction in the status bar and progress bar."""
         self.top_bar.show_status(
-            f"⚡ Compacting conversation ({current_tok:,} tokens exceeded 75% limit)…",
+            f"Compacting conversation ({current_tok:,} tokens exceeded 75% limit)…",
             40,
         )
 
     def _add_notice_row(self, markdown_text: str) -> None:
         """Insert a small notice row into the chat history (not saved to messages)."""
+        clean_text, category = strip_emoji_prefix(markdown_text)
+        category_icons = {
+            "search": "search",
+            "fetch": "external-link",
+            "read": "file",
+            "check": "check",
+            "warn": "alert-triangle",
+        }
+        notice_icon = category_icons.get(category) if category else None
+        if notice_icon is None:
+            notice_icon = "flask" if "research" in clean_text.lower() else "message"
+
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(8)
+        icon_label = QLabel()
+        icon_label.setPixmap(icon(notice_icon, DARK.colors.text_secondary, 16).pixmap(16, 16))
+        row_layout.addWidget(icon_label)
         try:
             from ui.message_widget import ChatMessageWidget
 
-            notice = ChatMessageWidget("assistant", markdown_text)
-            self.history_layout.insertWidget(self.history_layout.count() - 1, notice)
+            notice = ChatMessageWidget("assistant", clean_text)
+            row_layout.addWidget(notice, 1)
         except Exception:
-            notice = QLabel(markdown_text)
-            notice.setStyleSheet("color: #abb2bf; font-size: 11px; font-style: italic; padding: 2px 0;")
-            self.history_layout.insertWidget(self.history_layout.count() - 1, notice)
+            notice = QLabel(clean_text)
+            notice.setProperty("role", "muted")
+            row_layout.addWidget(notice, 1)
+        self.history_layout.insertWidget(self.history_layout.count() - 1, row)
 
     @Slot(list, int, int)
     def _on_compaction_performed(self, new_messages: list, old_tok: int, new_tok: int) -> None:
-        """Apply compacted messages to chat history so future requests don't loop compaction!"""
-        self._messages = list(new_messages)
-        self._save_current_conversation()
-        self._update_token_meter()
-
-        notice = QLabel(f"⚡ Compacted conversation (~{old_tok:,} → ~{new_tok:,} tokens)")
-        notice.setStyleSheet("color: #e5c07b; font-size: 11px; font-style: italic; padding: 2px 0;")
-        self.history_layout.insertWidget(self.history_layout.count() - 2, notice)
-
-        self.top_bar.show_status(
-            f"✅ Compacted to {new_tok:,} tokens! Connecting to model…",
-            75,
+        self._active_controller.session.apply_compaction(new_messages)
+        self._on_controller_compaction_notice(
+            self._active_controller, old_tok, new_tok
         )
+        self._on_controller_persist_needed(self._active_controller)
 
     @Slot(str, dict)
     def _on_chat_finished(self, full_content: str, meta: dict) -> None:
-        self._stream_flush_timer.stop()
-        self._pending_stream_dirty = False
-        self.top_bar.set_idle()
-        if self._active_plan and getattr(self, "_is_hybrid_mode", False):
-            footer = (
-                f"\n\n---\n### 📋 Project Plan Ready: {self._active_plan.goal} ({len(self._active_plan.steps)} steps)\n\n"
-                + "\n".join(f"- **Step {s.step}**: {s.description} → `{s.file}`" for s in self._active_plan.steps)
-                + "\n\n👉 A complete project plan has been prepared in the **📋 Plan** tab! Switch to the Plan tab and click **Approve & Start Coding** whenever you're ready to build."
-            )
-            full_content += footer
-            self._is_hybrid_mode = False
-
-        if self._current_assistant_widget:
-            self._current_assistant_widget.set_content(full_content, is_final=True)
-
-        self._messages.append({"role": "assistant", "content": full_content})
-        p, e = meta.get("prompt_eval_count", 0), meta.get("eval_count", 0)
-        self._last_prompt_eval_tokens = (p + e) if p else 0
-        self._update_token_meter()
-        self.top_bar.hide_status()
-        self._save_current_conversation()
-        self._cleanup_workers_state()
-        self._add_retry_button()
-
-        # Request AI title after chat finishes (avoids model reload race)
-        if not self._current_chat_has_ai_title and self._last_user_prompt:
-            url = self._settings.get("ollama_url", "http://localhost:11434")
-            model = self.top_bar.current_model()
-            num_ctx = getattr(self, "_active_num_ctx", int(self._settings.get("num_ctx", 8192)))
-            self._request_ai_chat_title(self._current_chat_id, self._last_user_prompt, model, url, num_ctx)
+        self._active_controller.on_chat_finished(full_content, meta)
 
     @Slot(str)
     def _on_worker_error(self, err_msg: str) -> None:
-        self._stop_research_heartbeat()
-        self.top_bar.set_idle()
-        if self._current_assistant_widget:
-            self._current_assistant_widget.set_content(f"⚠️ {err_msg}")
-        self.top_bar.hide_status()
-        self._cleanup_workers_state()
-        self._add_retry_button()
+        self._active_controller.on_chat_error(err_msg)
 
     def _stop_chat_generation(self) -> None:
         """Stop chat and planning workers without interrupting background code builds."""
-        self._stop_research_heartbeat()
-        if hasattr(self, "_stream_flush_timer") and self._stream_flush_timer.isActive():
-            self._stream_flush_timer.stop()
-            self._flush_stream_ui()
-        for w in (self._active_chat_worker, self._active_plan_worker,
-                  self._classify_worker, self._active_research_worker):
-            if w and w.isRunning():
-                if hasattr(w, "stop"):
-                    w.stop()
-        self._active_title_workers.clear()
-        self._active_chat_worker = None
-        self._active_plan_worker = None
-        self._classify_worker = None
-        self._active_research_worker = None
-        self._current_assistant_widget = None
+        self._active_controller.stop_chat_workers()
+        if self._active_research_worker is None:
+            self._stop_research_heartbeat()
 
     def _stop_generation(self) -> None:
         """Handle explicit Stop button click."""
         self._stop_chat_generation()
 
-        if self._active_code_worker and self._active_code_worker.isRunning():
-            self._active_code_worker.stop()
-            self._active_code_worker.wait(500)
-            self._active_code_worker = None
+        if worker_is_running(self._active_code_worker) and (
+            self._building_chat_id == self._current_chat_id
+        ):
+            request_stop(self._active_code_worker)
+            wait_briefly(self._active_code_worker)
 
         if self._build_running:
-            self._build_running = False
-            self.top_bar.set_idle()
             target_id = self._building_chat_id or self._current_chat_id
             if self._building_plan:
-                save_session(target_id, self._building_plan, self._building_files, get_resume_step(self._building_plan))
+                save_session(
+                    target_id,
+                    self._building_plan,
+                    self._building_files,
+                    get_resume_step(self._building_plan),
+                    workspace_id=self._building_workspace_id,
+                )
                 self.sidebar.show_wip(target_id)
             if self._current_chat_id == target_id:
-                self.plan_panel.btn_approve.setText("▶ Resume Building")
-                self.plan_panel.btn_approve.setEnabled(True)
+                if worker_is_running(self._active_code_worker):
+                    self.plan_panel.btn_approve.setText("Stopping build…")
+                    self.plan_panel.btn_approve.setEnabled(False)
+                else:
+                    self.plan_panel.btn_approve.setText("▶ Resume Building")
+                    self.plan_panel.btn_approve.setEnabled(True)
 
         self.top_bar.hide_status()
         self._cleanup_workers_state()
         self._add_retry_button()
+        self._on_controller_persist_needed(self._active_controller)
 
     def _cleanup_workers_state(self) -> None:
-        self.btn_send.setEnabled(True)
-        if not self._build_running and not self._active_chat_worker:
-            self.btn_stop.setEnabled(False)
-        self._active_chat_worker = None
-        self._active_plan_worker = None
-        self._classify_worker = None
-        self._active_research_worker = None
-        self._current_assistant_widget = None
+        self._sync_active_controls()
 
     def _save_current_conversation(self) -> None:
-        # Never save empty conversations — prevents ghost chat creation
-        if not self._messages:
-            return
-
-        title = self._current_chat_title or next(
-            (m["content"][:30] + ("…" if len(m["content"]) > 30 else "") for m in self._messages if m["role"] == "user"),
-            "New Chat",
-        )
-        chat_data: dict[str, Any] = {
-            "id": self._current_chat_id,
-            "title": title,
-            "ai_title": self._current_chat_has_ai_title,
-            "messages": self._messages,
-            "workspace_id": self._workspace_id,
-            "research_project_id": self._research_project_id,
-        }
-        # Stop storing file contents in chat JSON for builds that have a workspace
-        if not self._workspace_id:
-            chat_data["artifacts"] = dict(self._build_files)
-        if self._active_plan:
-            chat_data["plan"] = {
-                "goal": self._active_plan.goal,
-                "assumptions": self._active_plan.assumptions,
-                "files": self._active_plan.files,
-                "project_name": getattr(self._active_plan, "project_name", ""),
-                "steps": [
-                    {
-                        "step": s.step,
-                        "description": s.description,
-                        "file": s.file,
-                        "completed": s.completed,
-                        "action": getattr(s, "action", "create"),
-                    }
-                    for s in self._active_plan.steps
-                ],
-                "raw_text": self._active_plan.raw_text,
-            }
-        save_chat(chat_data)
-        self.sidebar.upsert_chat(self._current_chat_id, title)
+        self._on_controller_persist_needed(self._active_controller)
 
     def _add_load_earlier_button(self) -> None:
         """Add a 'Load earlier messages' button at the top of the chat history."""
         self._remove_load_earlier_button()
         btn = QPushButton("⬆ Load earlier messages")
         btn.setObjectName("load_earlier_btn")
-        btn.setStyleSheet(
-            "QPushButton { font-size: 12px; padding: 6px 16px; background: #282c34; "
-            "color: #61afef; border: 1px solid #3e4451; border-radius: 4px; font-weight: bold; }"
-            "QPushButton:hover { background: #3e4451; color: #ffffff; border-color: #61afef; }"
-        )
+        btn.setProperty("variant", "ghost")
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.clicked.connect(self._on_load_earlier_clicked)
         # Insert at position 0 (before the stretch and all messages)
@@ -2068,19 +2563,29 @@ class ChatPage(QWidget):
         """Apply AI-generated conversation title to sidebar, memory, and disk."""
         if not title:
             return
-        # 1. Update sidebar item
-        self.sidebar.upsert_chat(chat_id, title)
-
-        # 2. Update memory if current chat
+        controller = self._controllers.get(chat_id)
+        if controller and controller.session.ai_title:
+            return
+        existing_data = None
+        if controller is None:
+            existing_data = load_chat(chat_id)
+            if existing_data and existing_data.get("ai_title"):
+                return
+        # Update memory if this conversation is currently loaded.
         if self._current_chat_id == chat_id:
             self._current_chat_title = title
             self._current_chat_has_ai_title = True
+        if controller:
+            controller.session.title = title
+            controller.session.ai_title = True
 
-        # 3. Update saved file on disk
-        if c_data := load_chat(chat_id):
+        if controller:
+            self._on_controller_persist_needed(controller)
+        elif c_data := existing_data:
             c_data["title"] = title
             c_data["ai_title"] = True
             save_chat(c_data)
+        self.sidebar.upsert_chat(chat_id, title)
 
     def _on_scroll_value_changed(self, value: int) -> None:
         """Track if the user has manually scrolled up to read earlier text."""
@@ -2107,9 +2612,54 @@ class ChatPage(QWidget):
 
     def _open_settings(self) -> None:
         if SettingsDialog(self._settings, self._models, parent=self).exec():
-            self._on_model_changed(self.top_bar.current_model())
-            # Re-apply internet access state after settings change
+            low_power = bool(self._settings.get("low_power_mode", False))
+            self.top_bar.set_low_power_mode(low_power)
+            self.sidebar.set_low_power_mode(low_power)
+            self.top_bar.set_keep_alive_seconds(
+                get_effective_keep_alive_seconds(self._settings)
+            )
             self.top_bar.set_internet_access(bool(self._settings.get("internet_access", False)))
+            self.top_bar.set_models(
+                self._models,
+                self._settings.get("default_model", ""),
+            )
+            self._on_model_changed(self.top_bar.current_model())
 
     def stop_workers(self) -> None:
-        self._stop_generation()
+        self._auto_timer.stop()
+        self._draft_save_timer.stop()
+        for controller in tuple(self._controllers.values()):
+            if controller.is_busy():
+                controller.stop_chat_workers()
+            for worker in (
+                controller.chat_worker,
+                controller.plan_worker,
+                controller.research_worker,
+                controller.classify_worker,
+                controller.route_worker,
+            ):
+                if worker_is_running(worker):
+                    request_stop(worker)
+                    wait_briefly(worker)
+            self._on_controller_persist_needed(controller)
+
+        if worker_is_running(self._active_code_worker):
+            request_stop(self._active_code_worker)
+            wait_briefly(self._active_code_worker)
+        if self._build_running and self._building_chat_id and self._building_plan:
+            save_session(
+                self._building_chat_id,
+                self._building_plan,
+                self._building_files,
+                get_resume_step(self._building_plan),
+                workspace_id=self._building_workspace_id,
+            )
+
+        for worker in tuple(self._active_title_workers):
+            if worker_is_running(worker):
+                request_stop(worker)
+                wait_briefly(worker)
+        if worker_is_running(self._preload_worker):
+            request_stop(self._preload_worker)
+            wait_briefly(self._preload_worker)
+        self._stop_research_heartbeat()

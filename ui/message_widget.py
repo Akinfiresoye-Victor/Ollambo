@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QFont, QGuiApplication
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -26,6 +26,36 @@ from PySide6.QtWidgets import (
 )
 
 from core.markdown_formatter import markdown_to_html
+from ui.icons import icon
+from ui.theme import set_variant
+from ui.widgets.auto_text_view import AutoTextView
+
+
+class ThinkingIndicator(QLabel):
+    """Small animated three-dot indicator used while the assistant is producing text."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._dots = ["", ".", "..", "..."]
+        self._index = 0
+        self.setProperty("role", "muted")
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(250)
+        self._tick()
+
+    def _tick(self) -> None:
+        self.setText(f"Thinking{self._dots[self._index]}")
+        self._index = (self._index + 1) % len(self._dots)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._timer.isActive():
+            self._timer.start(250)
+
+    def hideEvent(self, event) -> None:
+        self._timer.stop()
+        super().hideEvent(event)
 
 
 class CodeBlockWidget(QFrame):
@@ -37,55 +67,39 @@ class CodeBlockWidget(QFrame):
         self.language = language
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.setStyleSheet(
-            "CodeBlockWidget {"
-            "  background-color: #1e1e1e;"
-            "  border: 1px solid #333333;"
-            "  border-radius: 5px;"
-            "  margin: 6px 0px;"
-            "}"
-        )
+        self.setProperty("role", "card")
+        self.setObjectName("CodeBlock")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 8)
         layout.setSpacing(4)
 
-        # Header bar (Language label + Copy button)
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
 
         lang_display = language.strip() or "code"
         self.lang_label = QLabel(lang_display)
-        self.lang_label.setStyleSheet("color: #61afef; font-size: 11px; font-weight: bold; font-family: Consolas;")
+        self.lang_label.setProperty("role", "accent")
         header.addWidget(self.lang_label)
         header.addStretch()
 
         self.copy_btn = QPushButton("Copy")
-        self.copy_btn.setFixedWidth(64)
-        self.copy_btn.setStyleSheet(
-            "QPushButton { font-size: 11px; padding: 3px 8px; background: #282c34; color: #abb2bf; "
-            "border: 1px solid #3e4451; border-radius: 3px; font-weight: bold; }"
-            "QPushButton:hover { background: #3e4451; color: #ffffff; }"
-        )
+        self.copy_btn.setFixedWidth(72)
+        self.copy_btn.setIcon(icon("copy"))
+        self.copy_btn.setToolTip("Copy code")
+        set_variant(self.copy_btn, "ghost")
         self.copy_btn.clicked.connect(self._copy_to_clipboard)
         header.addWidget(self.copy_btn)
         layout.addLayout(header)
 
-        # Code editor area
         self.edit = QPlainTextEdit()
         self.edit.setReadOnly(True)
         self.edit.setPlainText(code)
-        self.edit.setFont(QFont("Consolas", 10))
-        self.edit.setStyleSheet(
-            "QPlainTextEdit {"
-            "  background-color: #14161a;"
-            "  color: #abb2bf;"
-            "  border: 1px solid #21252b;"
-            "  border-radius: 3px;"
-            "  selection-background-color: #264f78;"
-            "  font-family: Consolas, monospace;"
-            "}"
-        )
+        self.edit.setProperty("role", "code")
+        self.edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.edit.wheelEvent = lambda event: event.ignore() if event is not None else None
 
         self._update_editor_height(code)
         layout.addWidget(self.edit)
@@ -112,8 +126,9 @@ class CodeBlockWidget(QFrame):
         clipboard = QGuiApplication.clipboard()
         if clipboard:
             clipboard.setText(self.code)
-            self.copy_btn.setText("Copied!")
-            QTimer.singleShot(1500, lambda: self.copy_btn.setText("Copy"))
+            self.copy_btn.setIcon(icon("check"))
+            self.copy_btn.setText("Copied")
+            QTimer.singleShot(1500, lambda: (self.copy_btn.setIcon(icon("copy")), self.copy_btn.setText("Copy")))
 
 
 _CODE_BLOCK_PATTERN = re.compile(r"```([a-zA-Z0-9_\-\+]*)\n?(.*?)```", re.DOTALL)
@@ -140,51 +155,37 @@ class ChatMessageWidget(QFrame):
         self._closed_segments: list[dict] = []
         self._closed_idx = 0
 
-        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setFrameShadow(QFrame.Shadow.Plain)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         is_user = role == "user"
-        bg_color = "#24272e" if is_user else "#1e2227"
-        border_color = "#3b4048" if is_user else "#2c313a"
-        self.setStyleSheet(
-            f"ChatMessageWidget {{"
-            f"  background-color: {bg_color};"
-            f"  border: 1px solid {border_color};"
-            f"  border-radius: 6px;"
-            f"  margin: 4px 0px;"
-            f"}}"
-        )
+        self.setProperty("messageRole", role)
 
         self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(12, 10, 12, 10)
+        self._layout.setContentsMargins(0, 2, 0, 2)
         self._layout.setSpacing(6)
 
-        # Header with role title and Ollambo face for assistant
-        hdr_row = QHBoxLayout()
-        hdr_row.setContentsMargins(0, 0, 0, 0)
-        hdr_row.setSpacing(6)
-        if not is_user:
-            from core.assets import get_app_pixmap
-            pix = get_app_pixmap(18)
-            if not pix.isNull():
-                av = QLabel()
-                av.setPixmap(pix)
-                hdr_row.addWidget(av)
-        sender_name = "You" if is_user else "Ollambo"
-        title = QLabel(sender_name)
-        title.setStyleSheet(
-            f"font-weight: bold; font-size: 13px; color: {'#61afef' if is_user else '#98c379'};"
-        )
-        hdr_row.addWidget(title)
-        hdr_row.addStretch()
-        self._layout.addLayout(hdr_row)
-
-        # Content container
         self._content_container = QWidget()
         self._content_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._content_layout = QVBoxLayout(self._content_container)
         self._content_layout.setContentsMargins(0, 0, 0, 0)
         self._content_layout.setSpacing(4)
-        self._layout.addWidget(self._content_container)
+
+        if not is_user:
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(8)
+            from core.assets import get_app_pixmap
+            pix = get_app_pixmap(18)
+            if not pix.isNull():
+                av = QLabel()
+                av.setPixmap(pix)
+                av.setFixedSize(18, 18)
+                row.addWidget(av)
+            row.addWidget(self._content_container, 1)
+            self._layout.addLayout(row)
+        else:
+            self._layout.addWidget(self._content_container)
 
         self.set_content(content, is_final=bool(content))
 
@@ -194,11 +195,11 @@ class ChatMessageWidget(QFrame):
             att_row.setSpacing(6)
             for att in self._attachments:
                 name = att.get("name", "Project")
-                chip = QLabel(f"📎 {name}")
-                chip.setStyleSheet(
-                    "background-color: #2c313a; color: #61afef; border: 1px solid #3e4451; "
-                    "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: bold;"
-                )
+                icon_label = QLabel()
+                icon_label.setPixmap(icon("file", size=16).pixmap(16, 16))
+                att_row.addWidget(icon_label)
+                chip = QLabel(name)
+                chip.setProperty("role", "attachment")
                 att_row.addWidget(chip)
             att_row.addStretch()
             self._layout.addLayout(att_row)
@@ -216,8 +217,7 @@ class ChatMessageWidget(QFrame):
         if not new_content.strip():
             if not self._placeholder:
                 self._clear_all_blocks()
-                self._placeholder = QLabel("Thinking…")
-                self._placeholder.setStyleSheet("color: #777777; font-style: italic; font-size: 13px;")
+                self._placeholder = ThinkingIndicator()
                 self._content_layout.addWidget(self._placeholder)
             return
 
@@ -288,11 +288,9 @@ class ChatMessageWidget(QFrame):
                             if curr["content"] != seg["content"] or is_final:
                                 curr["content"] = seg["content"]
                                 if is_final:
-                                    curr["widget"].setTextFormat(Qt.TextFormat.RichText)
-                                    curr["widget"].setText(markdown_to_html(seg["content"]))
+                                    curr["widget"].setHtml(markdown_to_html(seg["content"]))
                                 else:
-                                    curr["widget"].setTextFormat(Qt.TextFormat.PlainText)
-                                    curr["widget"].setText(seg["content"])
+                                    curr["widget"].setPlainText(seg["content"])
                                 curr["widget"].update()
                         else:  # code
                             curr["content"] = seg["content"]
@@ -328,28 +326,20 @@ class ChatMessageWidget(QFrame):
         if is_final:
             for b in self._blocks:
                 if b["type"] == "text":
-                    b["widget"].setTextFormat(Qt.TextFormat.RichText)
-                    b["widget"].setText(markdown_to_html(b["content"]))
+                    b["widget"].setHtml(markdown_to_html(b["content"]))
                     b["widget"].update()
 
     def _create_segment_widget(self, seg: dict, is_final: bool = True) -> QWidget:
-        """Create a QLabel for text or a CodeBlockWidget for code."""
+        """Create rich-text content or a code block widget."""
         if seg["type"] == "text":
-            lbl = QLabel()
-            lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-            lbl.setWordWrap(True)
-            lbl.setOpenExternalLinks(True)
-            lbl.setTextInteractionFlags(
-                Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse
-            )
-            lbl.setStyleSheet("color: #abb2bf; font-size: 13px; line-height: 1.45;")
+            view = AutoTextView()
+            view.setProperty("role", "body")
             if is_final:
-                lbl.setTextFormat(Qt.TextFormat.RichText)
-                lbl.setText(markdown_to_html(seg["content"]))
+                view.setHtml(markdown_to_html(seg["content"]))
             else:
-                lbl.setTextFormat(Qt.TextFormat.PlainText)
-                lbl.setText(seg["content"])
-            return lbl
+                view.setPlainText(seg["content"])
+            view._update_height()
+            return view
         else:
             return CodeBlockWidget(seg["content"], language=seg.get("lang", ""))
 

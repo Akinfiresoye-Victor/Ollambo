@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
 )
 
 from core.storage import save_settings
+from ui.icons import icon
+from ui.theme import set_variant
 
 
 class SettingsDialog(QDialog):
@@ -102,6 +104,7 @@ class SettingsDialog(QDialog):
 
         # 8. Low-Power Mode
         self.low_power_check = QCheckBox("Enable Low-Power Mode (conserves CPU, RAM & VRAM)")
+        self.low_power_check.setIcon(icon("cpu"))
         self.low_power_check.setChecked(bool(self._settings.get("low_power_mode", False)))
         form.addRow("Low-Power Mode:", self.low_power_check)
 
@@ -124,6 +127,7 @@ class SettingsDialog(QDialog):
         self.workspaces_dir_edit = QLineEdit(str(self._settings.get("workspaces_dir", "")))
         self.workspaces_dir_edit.setPlaceholderText("Default: <data_dir>/workspaces")
         ws_browse_btn = QPushButton("Browse...")
+        ws_browse_btn.setIcon(icon("folder"))
         ws_browse_btn.clicked.connect(self._on_browse_workspaces_dir)
         ws_layout.addWidget(self.workspaces_dir_edit)
         ws_layout.addWidget(ws_browse_btn)
@@ -141,7 +145,8 @@ class SettingsDialog(QDialog):
         btn_layout.addWidget(cancel_btn)
 
         save_btn = QPushButton("Save Settings")
-        save_btn.setStyleSheet("font-weight: bold;")
+        save_btn.setIcon(icon("check"))
+        set_variant(save_btn, "primary")
         save_btn.clicked.connect(self._on_save)
         btn_layout.addWidget(save_btn)
 

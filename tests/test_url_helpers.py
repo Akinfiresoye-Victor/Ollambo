@@ -81,6 +81,17 @@ class TestExtractUrls(unittest.TestCase):
         result = extract_urls(text)
         self.assertEqual(result, [])
 
+    def test_source_filenames_not_treated_as_websites(self) -> None:
+        from core.web_research import extract_urls
+        text = "Please edit main.py, app.py, README.md and index.js in this project"
+        self.assertEqual(extract_urls(text), [])
+
+    def test_explicit_http_url_with_file_path_still_extracted(self) -> None:
+        from core.web_research import extract_urls
+        text = "See https://example.com/main.py for the sample"
+        result = extract_urls(text)
+        self.assertTrue(any("example.com" in u for u in result))
+
 
 class TestExtractTextJsSpa(unittest.TestCase):
     """Test that JS-rendered SPAs get metadata extraction instead of empty text."""

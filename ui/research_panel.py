@@ -39,7 +39,11 @@ from core.research_store import (
     open_project_folder,
     rename_project,
 )
+from ui.icons import icon
+from ui.theme import set_property, set_variant
+from ui.text_utils import strip_emoji_prefix
 from ui.report_viewer import ReportViewerDialog
+from ui.widgets.toast import show_toast
 
 
 class ResearchPanel(QWidget):
@@ -64,24 +68,25 @@ class ResearchPanel(QWidget):
 
         # Top row: title, search bar, refresh button
         top_row = QHBoxLayout()
-        title = QLabel("📚 Research Library")
-        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #61afef;")
+        title = QLabel("Research library")
+        title.setProperty("role", "title")
+        title_icon = QLabel()
+        title_icon.setPixmap(icon("flask", size=18).pixmap(18, 18))
+        top_row.addWidget(title_icon)
         top_row.addWidget(title)
 
         top_row.addStretch()
 
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("🔍 Filter research projects…")
+        self.search_input.setPlaceholderText("Filter research projects…")
+        self.search_input.addAction(icon("search"), QLineEdit.ActionPosition.LeadingPosition)
         self.search_input.setFixedWidth(240)
-        self.search_input.setStyleSheet(
-            "QLineEdit { background-color: #21252b; color: #abb2bf; border: 1px solid #333842; "
-            "border-radius: 4px; padding: 4px 8px; }"
-        )
         self.search_input.textChanged.connect(self._apply_filter)
         top_row.addWidget(self.search_input)
 
-        btn_refresh = QPushButton("↻ Refresh")
-        btn_refresh.setStyleSheet("padding: 4px 10px; background-color: #282c34; border-radius: 4px;")
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.setIcon(icon("refresh"))
+        btn_refresh.setProperty("variant", "ghost")
         btn_refresh.clicked.connect(self.refresh)
         top_row.addWidget(btn_refresh)
 
@@ -101,49 +106,46 @@ class ResearchPanel(QWidget):
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_context_menu)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
-        self.table.setStyleSheet(
-            "QTableWidget { background-color: #1e2227; color: #abb2bf; gridline-color: #282c34; "
-            "border: 1px solid #333842; border-radius: 4px; }"
-            "QHeaderView::section { background-color: #21252b; color: #e5c07b; font-weight: bold; padding: 6px; border: none; }"
-            "QTableWidget::item:selected { background-color: #2c313a; color: #ffffff; }"
-        )
         self.table.itemDoubleClicked.connect(self._on_table_double_clicked)
         layout.addWidget(self.table)
 
         # Action Buttons Row
         actions_row = QHBoxLayout()
-        self.btn_open = QPushButton("📖 Open Report")
-        self.btn_open.setStyleSheet(
-            "QPushButton { background-color: #61afef; color: #1e1e1e; font-weight: bold; padding: 6px 14px; border-radius: 4px; }"
-            "QPushButton:hover { background-color: #529fd8; }"
-        )
+        self.btn_open = QPushButton("Open report")
+        self.btn_open.setIcon(icon("file"))
+        set_variant(self.btn_open, "primary")
         self.btn_open.clicked.connect(self._on_open_selected)
         actions_row.addWidget(self.btn_open)
 
-        self.btn_resume = QPushButton("▶ Resume")
-        self.btn_resume.setStyleSheet("padding: 6px 12px; background-color: #98c379; color: #1e1e1e; font-weight: bold; border-radius: 4px;")
+        self.btn_resume = QPushButton("Resume")
+        self.btn_resume.setIcon(icon("arrow-up"))
+        set_variant(self.btn_resume, "primary")
         self.btn_resume.clicked.connect(self._on_resume_selected)
         actions_row.addWidget(self.btn_resume)
 
-        self.btn_rename = QPushButton("✏ Rename")
-        self.btn_rename.setStyleSheet("padding: 6px 12px; background-color: #282c34; border-radius: 4px;")
+        self.btn_rename = QPushButton("Rename")
+        self.btn_rename.setIcon(icon("pencil"))
+        self.btn_rename.setProperty("variant", "ghost")
         self.btn_rename.clicked.connect(self._on_rename_selected)
         actions_row.addWidget(self.btn_rename)
 
-        self.btn_export = QPushButton("💾 Export .md")
-        self.btn_export.setStyleSheet("padding: 6px 12px; background-color: #282c34; border-radius: 4px;")
+        self.btn_export = QPushButton("Export .md")
+        self.btn_export.setIcon(icon("download"))
+        self.btn_export.setProperty("variant", "ghost")
         self.btn_export.clicked.connect(self._on_export_selected)
         actions_row.addWidget(self.btn_export)
 
-        self.btn_folder = QPushButton("📁 Open Folder")
-        self.btn_folder.setStyleSheet("padding: 6px 12px; background-color: #282c34; border-radius: 4px;")
+        self.btn_folder = QPushButton("Open folder")
+        self.btn_folder.setIcon(icon("folder"))
+        self.btn_folder.setProperty("variant", "ghost")
         self.btn_folder.clicked.connect(self._on_folder_selected)
         actions_row.addWidget(self.btn_folder)
 
         actions_row.addStretch()
 
-        self.btn_delete = QPushButton("🗑 Delete")
-        self.btn_delete.setStyleSheet("padding: 6px 12px; background-color: #e06c75; color: #1e1e1e; font-weight: bold; border-radius: 4px;")
+        self.btn_delete = QPushButton("Delete")
+        self.btn_delete.setIcon(icon("trash"))
+        set_variant(self.btn_delete, "danger")
         self.btn_delete.clicked.connect(self._on_delete_selected)
         actions_row.addWidget(self.btn_delete)
 
@@ -151,38 +153,34 @@ class ResearchPanel(QWidget):
 
         # Progress Steps Box
         self.progress_frame = QFrame()
-        self.progress_frame.setStyleSheet(
-            "QFrame { background-color: #21252b; border: 1px solid #333842; border-radius: 6px; padding: 6px; }"
-        )
+        self.progress_frame.setProperty("role", "card")
         step_layout = QHBoxLayout(self.progress_frame)
         step_layout.setContentsMargins(10, 6, 10, 6)
         step_layout.setSpacing(8)
 
         step_lbl = QLabel("Research Stage:")
-        step_lbl.setStyleSheet("font-weight: bold; color: #e5c07b; font-size: 11px;")
+        step_lbl.setProperty("role", "section")
         step_layout.addWidget(step_lbl)
 
         self.step_labels: dict[str, QLabel] = {}
         for s in self._STEPS:
             lbl = QLabel(s)
-            lbl.setStyleSheet("color: #5c6370; font-size: 11px; padding: 2px 8px; border-radius: 3px;")
+            lbl.setProperty("role", "tertiary")
             step_layout.addWidget(lbl)
             self.step_labels[s.lower()] = lbl
 
         step_layout.addSpacing(8)
 
+        self.stage_status_icon = QLabel()
+        step_layout.addWidget(self.stage_status_icon)
         self.stage_status_lbl = QLabel("Ready")
-        self.stage_status_lbl.setStyleSheet("color: #61afef; font-size: 11px; font-weight: bold;")
+        self.stage_status_lbl.setProperty("role", "accent")
         step_layout.addWidget(self.stage_status_lbl)
 
         self.stage_progress_bar = QProgressBar()
-        self.stage_progress_bar.setFixedHeight(8)
+        self.stage_progress_bar.setFixedHeight(4)
         self.stage_progress_bar.setFixedWidth(100)
         self.stage_progress_bar.setTextVisible(False)
-        self.stage_progress_bar.setStyleSheet(
-            "QProgressBar { background-color: #282c34; border: 1px solid #3e4451; border-radius: 3px; }"
-            "QProgressBar::chunk { background-color: #98c379; border-radius: 2px; }"
-        )
         self.stage_progress_bar.setVisible(False)
         step_layout.addWidget(self.stage_progress_bar)
 
@@ -255,7 +253,7 @@ class ResearchPanel(QWidget):
         """Open ReportViewerDialog for the selected project."""
         md = load_report(project_id)
         if not md:
-            QMessageBox.information(self, "No Report", "This project has not completed writing a report yet.")
+            show_toast(self, "Report not ready yet", duration=2000)
             return
 
         # Find project title
@@ -294,7 +292,7 @@ class ResearchPanel(QWidget):
         dest, _ = QFileDialog.getSaveFileName(self, "Export Report", "report.md", "Markdown (*.md)")
         if dest:
             if export_report(pid, dest):
-                QMessageBox.information(self, "Exported", f"Report saved to {dest}")
+                show_toast(self, "Report exported")
             else:
                 QMessageBox.warning(self, "Export Failed", "Could not export report.")
 
@@ -325,11 +323,13 @@ class ResearchPanel(QWidget):
         status = proj.get("status", "")
         if status == "completed":
             self.btn_resume.setEnabled(False)
-            self.btn_resume.setText("✓ Done")
+            self.btn_resume.setText("Done")
+            self.btn_resume.setIcon(icon("check"))
             self.btn_open.setEnabled(True)
         else:
             self.btn_resume.setEnabled(True)
-            self.btn_resume.setText("▶ Resume")
+            self.btn_resume.setText("Resume")
+            self.btn_resume.setIcon(icon("arrow-up"))
 
     def _on_table_context_menu(self, pos) -> None:
         item = self.table.itemAt(pos)
@@ -344,29 +344,28 @@ class ResearchPanel(QWidget):
         status = proj.get("status", "")
 
         menu = QMenu(self)
-        menu.setStyleSheet("background-color: #21252b; color: #abb2bf; border: 1px solid #333842;")
 
-        act_open = menu.addAction("📖 Open Report")
+        act_open = menu.addAction(icon("file"), "Open report")
         act_open.triggered.connect(lambda: self.open_report(pid))
 
         if status != "completed":
-            act_resume = menu.addAction("▶ Resume Research")
+            act_resume = menu.addAction(icon("arrow-up"), "Resume research")
             act_resume.triggered.connect(lambda: self.resume_requested.emit(pid))
 
         menu.addSeparator()
 
-        act_rename = menu.addAction("✏ Rename…")
+        act_rename = menu.addAction(icon("pencil"), "Rename…")
         act_rename.triggered.connect(self._on_rename_selected)
 
-        act_export = menu.addAction("💾 Export Markdown…")
+        act_export = menu.addAction(icon("download"), "Export Markdown…")
         act_export.triggered.connect(self._on_export_selected)
 
-        act_folder = menu.addAction("📁 Open Folder in Explorer")
+        act_folder = menu.addAction(icon("folder"), "Open folder in Explorer")
         act_folder.triggered.connect(lambda: open_project_folder(pid))
 
         menu.addSeparator()
 
-        act_del = menu.addAction("🗑 Delete Project")
+        act_del = menu.addAction(icon("trash"), "Delete project")
         act_del.triggered.connect(self._on_delete_selected)
 
         menu.exec(self.table.viewport().mapToGlobal(pos))
@@ -375,13 +374,27 @@ class ResearchPanel(QWidget):
         """Highlight active step in progress frame and update progress bar."""
         s_low = step_name.lower()
         for name, lbl in self.step_labels.items():
-            if name in s_low or s_low in name:
-                lbl.setStyleSheet("background-color: #61afef; color: #1e1e1e; font-weight: bold; border-radius: 3px; padding: 2px 8px;")
-            else:
-                lbl.setStyleSheet("color: #5c6370; font-size: 11px; padding: 2px 8px;")
+            set_property(lbl, "active", name in s_low or s_low in name)
 
-        if message:
-            self.stage_status_lbl.setText(f"{step_name}: {message[:40]}")
+        clean_message, category = strip_emoji_prefix(message)
+        category_icons = {
+            "search": "search",
+            "fetch": "external-link",
+            "read": "file",
+            "check": "check",
+            "warn": "alert-triangle",
+        }
+        if category:
+            self.stage_status_icon.setPixmap(
+                icon(category_icons[category], size=16).pixmap(16, 16)
+            )
+        elif step_name.lower() in ("idle", "ready", "completed"):
+            self.stage_status_icon.clear()
+        else:
+            self.stage_status_icon.setPixmap(icon("loader", size=16).pixmap(16, 16))
+
+        if clean_message:
+            self.stage_status_lbl.setText(f"{step_name}: {clean_message[:40]}")
         else:
             self.stage_status_lbl.setText(step_name)
 

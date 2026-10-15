@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QApplication
 
 from core.storage import load_settings
 from ui.main_window import MainWindow
+from ui.theme import apply_theme
 
 
 def main() -> None:
@@ -32,7 +33,7 @@ def main() -> None:
 
     app = QApplication(sys.argv)
     app.setApplicationName("Ollambo")
-    app.setStyle("Fusion")  # Consistent look across Windows, macOS, Linux.
+    apply_theme(app)
 
     from core.assets import get_app_icon
     app_icon = get_app_icon()

@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.planner import CodingPlan
+from ui.theme import set_variant
 
 
 class PlanPanel(QFrame):
@@ -36,9 +37,7 @@ class PlanPanel(QFrame):
         super().__init__(parent)
         self._current_plan: CodingPlan | None = None
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setStyleSheet(
-            "PlanPanel { background-color: #21252b; border: 1px solid #333842; border-radius: 6px; padding: 6px; }"
-        )
+        self.setObjectName("Card")
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -48,34 +47,37 @@ class PlanPanel(QFrame):
 
         # Header Title
         title = QLabel("Proposed Coding Plan")
-        title.setStyleSheet("font-size: 14px; font-weight: bold; color: #61afef;")
+        title.setProperty("role", "title")
         layout.addWidget(title)
 
         # Goal Label
         self.lbl_goal = QLabel("Goal: -")
         self.lbl_goal.setWordWrap(True)
-        self.lbl_goal.setStyleSheet("font-size: 12px; color: #abb2bf;")
+        self.lbl_goal.setProperty("role", "muted")
         layout.addWidget(self.lbl_goal)
+
+        self.empty_state = QWidget()
+        empty_layout = QVBoxLayout(self.empty_state)
+        empty_layout.setContentsMargins(0, 12, 0, 0)
+        self.empty_label = QLabel("No plan yet. Ask for a project in Code mode.")
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setProperty("role", "muted")
+        empty_layout.addWidget(self.empty_label)
+        layout.addWidget(self.empty_state)
 
         # Checklist of steps
         lbl_steps = QLabel("Steps to Execute:")
-        lbl_steps.setStyleSheet("font-size: 12px; font-weight: bold; color: #e5c07b;")
+        lbl_steps.setProperty("role", "section")
         layout.addWidget(lbl_steps)
 
         self.list_steps = QListWidget()
-        self.list_steps.setStyleSheet(
-            "QListWidget { background-color: #1e2227; color: #dcdcdc; border: 1px solid #282c34; border-radius: 4px; }"
-            "QListWidget::item { padding: 4px; }"
-        )
         layout.addWidget(self.list_steps)
 
         # Raw notes / assumptions box (collapsible or small)
         self.notes_edit = QTextEdit()
         self.notes_edit.setPlaceholderText("Assumptions or notes…")
         self.notes_edit.setMaximumHeight(60)
-        self.notes_edit.setStyleSheet(
-            "background-color: #1b1d23; color: #888888; border: 1px solid #282c34; font-size: 11px;"
-        )
+        self.notes_edit.setProperty("role", "muted")
         layout.addWidget(self.notes_edit)
 
         # Buttons row
@@ -87,17 +89,29 @@ class PlanPanel(QFrame):
         btn_row.addStretch()
 
         self.btn_approve = QPushButton("Approve & Start Coding")
-        self.btn_approve.setStyleSheet(
-            "QPushButton { background-color: #98c379; color: #1e1e1e; font-weight: bold; padding: 6px 14px; border-radius: 4px; }"
-            "QPushButton:hover { background-color: #87b368; }"
-        )
+        set_variant(self.btn_approve, "primary")
         self.btn_approve.clicked.connect(self._on_approve)
         btn_row.addWidget(self.btn_approve)
         layout.addLayout(btn_row)
 
+        self._show_empty_state()
+
+    def _show_empty_state(self) -> None:
+        self.empty_state.setVisible(True)
+        self.list_steps.setVisible(False)
+        self.notes_edit.setVisible(False)
+        self.btn_reject.setVisible(False)
+        self.btn_approve.setVisible(False)
+        self._current_plan = None
+
     def set_plan(self, plan: CodingPlan) -> None:
         """Display a new plan in the panel."""
         self._current_plan = plan
+        self.empty_state.setVisible(False)
+        self.list_steps.setVisible(True)
+        self.notes_edit.setVisible(True)
+        self.btn_reject.setVisible(True)
+        self.btn_approve.setVisible(True)
         self.lbl_goal.setText(f"Goal: {plan.goal}")
 
         # Set assumptions text
@@ -109,13 +123,11 @@ class PlanPanel(QFrame):
         # Populate checklist
         self.list_steps.clear()
         for s in plan.steps:
-            text = f"Step {s.step}: {s.description}  →  `{s.file}`"
+            text = f"Step {s.step}: {s.description} → {s.file}"
             item = QListWidgetItem(text)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if s.completed else Qt.CheckState.Unchecked)
             self.list_steps.addItem(item)
-
-        self.setVisible(True)
 
     def mark_step_completed(self, step_number: int) -> None:
         """Mark a step as done in the checklist."""
@@ -123,7 +135,6 @@ class PlanPanel(QFrame):
             item = self.list_steps.item(i)
             if item.text().startswith(f"Step {step_number}:"):
                 item.setCheckState(Qt.CheckState.Checked)
-                item.setForeground(Qt.GlobalColor.darkGreen)
 
     def _on_approve(self) -> None:
         if self._current_plan:
@@ -131,5 +142,5 @@ class PlanPanel(QFrame):
             self.plan_approved.emit(self._current_plan)
 
     def _on_reject(self) -> None:
-        self.setVisible(False)
+        self._show_empty_state()
         self.plan_rejected.emit()

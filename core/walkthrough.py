@@ -101,9 +101,9 @@ def generate_project_walkthrough(plan: CodingPlan | None, files: dict[str, str])
             step_descriptions[norm] = s.description
 
     lines = [
-        f"## 🎉 Build Complete: {goal}\n",
+        f"## Build complete: {goal}\n",
         f"Generated **{total_files} {'file' if total_files == 1 else 'files'}** organized with full directory structure.\n",
-        "### 📁 Architecture & Components\n",
+        "### Architecture & components\n",
     ]
 
     for fname in sorted(files.keys()):
@@ -118,9 +118,9 @@ def generate_project_walkthrough(plan: CodingPlan | None, files: dict[str, str])
                 desc = "Documentation and setup guide"
             else:
                 desc = "Core module and implementation logic"
-        lines.append(f"- 📄 `{fname}` — {desc}")
+        lines.append(f"- `{fname}` — {desc}")
 
-    lines.append("\n### 🚀 Walkthrough: How to Run\n")
+    lines.append("\n### Walkthrough: how to run\n")
 
     step_num = 1
     if deps:
@@ -144,10 +144,10 @@ def generate_project_walkthrough(plan: CodingPlan | None, files: dict[str, str])
             lines.append(f"```bash\npython -m unittest {test_files[0]}\n```\n")
         step_num += 1
 
-    lines.append("**💡 Usage & Next Steps**")
+    lines.append("**Usage & next steps**")
     lines.append(
-        "- You can inspect and copy each file in the **📦 Artifacts** tab.\n"
-        "- Click **💾 Save All to Folder** in the Artifacts tab to export the full project hierarchy to disk.\n"
+        "- You can inspect and copy each file in the **Artifacts** tab.\n"
+        "- Click **Save All to Folder** in the Artifacts tab to export the full project hierarchy to disk.\n"
         "- If you want to modify features, add tests, or tweak logic, simply let me know!"
     )
 
