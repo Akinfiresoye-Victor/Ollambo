@@ -15,16 +15,22 @@ from PySide6.QtCore import QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSplitter,
     QStackedWidget,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+import core.workspace as workspace
+from core.code_writer import build_project_summary
+from core.project_router import classify_with_attachment, decide_project, route_with_llm
+from core.workspace_context import build_attachment_context
 from core.build_session import complete_session, get_resume_step, load_session, reconstruct_plan, save_session
 from core.context_manager import estimate_messages_tokens, is_compaction_needed
 from core.ollama_client import OllamaClient
@@ -95,6 +101,54 @@ class ClassifyWorker(QThread):
             client.close()
 
 
+class RouteWorker(QThread):
+    """Run LLM-based project routing off the GUI thread when heuristic is ambiguous."""
+
+    result_ready = Signal(str)  # Emits 'continue' or 'new'
+
+    def __init__(
+        self,
+        ollama_url: str,
+        model: str,
+        prompt: str,
+        workspace_summary: dict | None,
+        num_ctx: int = 8192,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._url = ollama_url
+        self._model = model
+        self._prompt = prompt
+        self._ws_summary = workspace_summary
+        self._num_ctx = num_ctx
+
+    def run(self) -> None:
+        decision = route_with_llm(
+            self._url,
+            self._model,
+            self._prompt,
+            self._ws_summary,
+            num_ctx=self._num_ctx,
+        )
+        self.result_ready.emit(decision)
+
+
+class ChatInputEdit(QTextEdit):
+    """Multiline input that sends on Enter and inserts a newline on Shift+Enter."""
+
+    send_requested = Signal()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                super().keyPressEvent(event)
+            else:
+                self.send_requested.emit()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+
 class PreloadWorker(QThread):
     """Background thread to preload/warm a model into RAM/VRAM without freezing UI."""
 
@@ -163,6 +217,15 @@ class ChatPage(QWidget):
         self._building_chat_id: str | None = None
         self._building_plan: CodingPlan | None = None
         self._building_files: dict[str, str] = {}
+
+        # Workspace and Project State
+        self._workspace_id: str | None = None
+        self._workspace_ids_history: list[str] = []
+        self._research_project_id: str | None = None
+        self._pending_project_target: dict[str, Any] | None = None
+        self._pending_attachments: list[dict[str, str]] = []
+        self._last_user_attachments: list[dict[str, str]] = []
+        self._route_worker: RouteWorker | None = None
 
         self._is_hybrid_mode = False
 
@@ -254,11 +317,37 @@ class ChatPage(QWidget):
         self.tabs.addTab(self.research_panel, "📚 Research")
         right_layout.addWidget(self.tabs)
 
+        # Removable Attachment Chips Bar
+        self.attachment_bar = QWidget()
+        self.attachment_bar_layout = QHBoxLayout(self.attachment_bar)
+        self.attachment_bar_layout.setContentsMargins(4, 2, 4, 2)
+        self.attachment_bar_layout.setSpacing(6)
+        self.attachment_bar.setVisible(False)
+        right_layout.addWidget(self.attachment_bar)
+
         # Bottom Input Area
         input_row = QHBoxLayout()
-        self.input_edit = QTextEdit()
-        self.input_edit.setPlaceholderText("Type a message or coding request…")
+
+        self.btn_attach = QToolButton()
+        self.btn_attach.setText("➕")
+        self.btn_attach.setToolTip("Attach an existing project or artifact")
+        self.btn_attach.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.btn_attach.setStyleSheet(
+            "QToolButton { font-size: 15px; font-weight: bold; padding: 4px 8px; "
+            "background-color: #282c34; border: 1px solid #3e4451; border-radius: 4px; color: #61afef; }"
+            "QToolButton:hover { background-color: #3e4451; color: #ffffff; }"
+        )
+        self.attach_menu = QMenu(self)
+        self.artifacts_submenu = QMenu("Artifacts", self.attach_menu)
+        self.artifacts_submenu.aboutToShow.connect(self._populate_artifacts_submenu)
+        self.attach_menu.addMenu(self.artifacts_submenu)
+        self.btn_attach.setMenu(self.attach_menu)
+        input_row.addWidget(self.btn_attach)
+
+        self.input_edit = ChatInputEdit()
+        self.input_edit.setPlaceholderText("Type a message or coding request… (Enter to send, Shift+Enter for new line)")
         self.input_edit.setMaximumHeight(80)
+        self.input_edit.send_requested.connect(self._send_message)
         input_row.addWidget(self.input_edit)
 
         btn_box = QVBoxLayout()
@@ -303,6 +392,7 @@ class ChatPage(QWidget):
             return
         w = ModelsWorker(self._settings.get("ollama_url", "http://localhost:11434"), parent=self)
         w.models_ready.connect(self.set_models)
+        w.finished.connect(w.deleteLater)
         w.start()
 
     # ── Keep-Alive & Model Warming ─────────────────────────────────────
@@ -327,6 +417,86 @@ class ChatPage(QWidget):
             uw = UnloadWorker(url, model, parent=self)
             uw.start()
 
+    # ── Attachments Handling ───────────────────────────────────────────
+
+    def _populate_artifacts_submenu(self) -> None:
+        self.artifacts_submenu.clear()
+        import core.workspace as workspace
+        import core.research_store as research_store
+
+        workspaces = workspace.list_workspaces()
+        research_projects = research_store.list_projects()
+
+        if not workspaces and not research_projects:
+            act = self.artifacts_submenu.addAction("No artifacts yet")
+            act.setEnabled(False)
+            return
+
+        if workspaces:
+            for ws in workspaces:
+                name = ws.get("name", "Untitled")
+                cnt = ws.get("file_count", len(ws.get("files", {})))
+                dt = ws.get("updated", "")[:10] or ws.get("created", "")[:10]
+                act = self.artifacts_submenu.addAction(f"💻 {name} ({cnt} files, {dt})")
+                wid = ws.get("id")
+                act.triggered.connect(lambda checked=False, w_id=wid, w_name=name: self._add_attachment(w_id, w_name, "code"))
+
+        if research_projects:
+            for rp in research_projects:
+                t = (rp.get("title") or rp.get("topic") or "Research")[:30]
+                dt = rp.get("date", "")[:10]
+                act = self.artifacts_submenu.addAction(f"🔬 {t} [Research] ({dt})")
+                rid = rp.get("id")
+                act.triggered.connect(lambda checked=False, r_id=rid, r_name=t: self._add_attachment(r_id, r_name, "research"))
+
+    def _add_attachment(self, att_id: str, name: str, kind: str) -> None:
+        if any(a["id"] == att_id for a in self._pending_attachments):
+            return
+        self._pending_attachments.append({"id": att_id, "name": name, "kind": kind})
+        self._render_attachment_chips()
+
+    def _remove_attachment(self, att_id: str) -> None:
+        self._pending_attachments = [a for a in self._pending_attachments if a["id"] != att_id]
+        self._render_attachment_chips()
+
+    def _render_attachment_chips(self) -> None:
+        while self.attachment_bar_layout.count():
+            item = self.attachment_bar_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not self._pending_attachments:
+            self.attachment_bar.setVisible(False)
+            return
+
+        for att in self._pending_attachments:
+            chip = QWidget()
+            chip_layout = QHBoxLayout(chip)
+            chip_layout.setContentsMargins(6, 2, 6, 2)
+            chip_layout.setSpacing(4)
+            chip.setStyleSheet(
+                "QWidget { background-color: #2c313a; border: 1px solid #3e4451; border-radius: 12px; }"
+            )
+            icon = "🔬 " if att.get("kind") == "research" else "📎 "
+            lbl = QLabel(f"{icon}{att['name']}")
+            lbl.setStyleSheet("color: #61afef; font-size: 11px; font-weight: bold; border: none; background: transparent;")
+            chip_layout.addWidget(lbl)
+
+            btn_del = QPushButton("✕")
+            btn_del.setFixedSize(16, 16)
+            btn_del.setStyleSheet(
+                "QPushButton { border: none; background: transparent; color: #abb2bf; font-size: 10px; font-weight: bold; } "
+                "QPushButton:hover { color: #e06c75; }"
+            )
+            att_id = att["id"]
+            btn_del.clicked.connect(lambda checked=False, a_id=att_id: self._remove_attachment(a_id))
+            chip_layout.addWidget(btn_del)
+
+            self.attachment_bar_layout.addWidget(chip)
+
+        self.attachment_bar_layout.addStretch()
+        self.attachment_bar.setVisible(True)
+
     # ── Chat & Tab Navigation ──────────────────────────────────────────
 
     def _start_new_chat(self) -> None:
@@ -345,6 +515,13 @@ class ChatPage(QWidget):
         self._active_plan = None
         self._build_files = {}
         self._last_user_prompt = ""
+        self._workspace_id = None
+        self._workspace_ids_history = []
+        self._research_project_id = None
+        self._pending_project_target = None
+        self._pending_attachments = []
+        self._last_user_attachments = []
+        self._render_attachment_chips()
 
         self._clear_history_ui()
         self.artifacts_panel.clear()
@@ -403,7 +580,16 @@ class ChatPage(QWidget):
         self._messages = data.get("messages", [])
         self._last_prompt_eval_tokens = 0
         self._clear_history_ui()
-        for msg in self._messages:
+
+        # Lazy-load: only show last 40 messages, add "Load earlier" button if needed
+        self._lazy_load_offset = 0
+        if len(self._messages) > 40:
+            self._lazy_load_offset = len(self._messages) - 40
+            self._add_load_earlier_button()
+            visible = self._messages[self._lazy_load_offset:]
+        else:
+            visible = self._messages
+        for msg in visible:
             self.history_layout.insertWidget(self.history_layout.count() - 1, ChatMessageWidget(msg["role"], msg["content"]))
 
         # Add retry button for the last assistant message
@@ -606,9 +792,8 @@ class ChatPage(QWidget):
         num_ctx = getattr(self, "_active_num_ctx", int(self._settings.get("num_ctx", 8192)))
         self._current_assistant_text = []
 
-        # Request AI summarization for conversation title if not yet established
-        if not self._current_chat_has_ai_title:
-            self._request_ai_chat_title(self._current_chat_id, text, model, url, num_ctx)
+        # AI title is requested after the main reply finishes (see _on_chat_finished / _on_plan_ready)
+        # to avoid model reload races when num_ctx differs.
 
         est_tokens = estimate_messages_tokens(self._messages)
         if is_compaction_needed(est_tokens, num_ctx, threshold_ratio=0.75):
@@ -646,6 +831,7 @@ class ChatPage(QWidget):
                 waw.token_received.connect(self._on_token_received)
                 waw.chat_finished.connect(self._on_chat_finished)
                 waw.chat_error.connect(self._on_worker_error)
+                waw.finished.connect(waw.deleteLater)
                 waw.start()
                 self._scroll_to_bottom(force=True)
                 return
@@ -672,6 +858,7 @@ class ChatPage(QWidget):
                 self.history_layout.insertWidget(self.history_layout.count() - 1, self._current_assistant_widget)
                 cw = self._classify_worker = ClassifyWorker(url, model, text, num_ctx, parent=self)
                 cw.result_ready.connect(lambda task_type: self._on_classify_done(task_type, text, url, model, num_ctx))
+                cw.finished.connect(cw.deleteLater)
                 cw.start()
 
         self._scroll_to_bottom(force=True)
@@ -739,6 +926,7 @@ class ChatPage(QWidget):
         rw.status_message.connect(self._on_research_progress)
         rw.research_done.connect(self._on_research_finished)
         rw.error.connect(self._on_worker_error)
+        rw.finished.connect(rw.deleteLater)
         rw.start()
         self._last_research_progress_time = time.monotonic()
         self._start_research_heartbeat()
@@ -866,6 +1054,7 @@ class ChatPage(QWidget):
         rw.status_message.connect(self._on_research_progress)
         rw.research_done.connect(self._on_research_finished)
         rw.error.connect(self._on_worker_error)
+        rw.finished.connect(rw.deleteLater)
         rw.start()
         self._last_research_progress_time = time.monotonic()
         self._start_research_heartbeat()
@@ -1067,6 +1256,7 @@ class ChatPage(QWidget):
         rw.status_message.connect(self._on_research_progress)
         rw.research_done.connect(self._on_research_finished)
         rw.error.connect(self._on_worker_error)
+        rw.finished.connect(rw.deleteLater)
         rw.start()
         self._last_research_progress_time = time.monotonic()
         self._start_research_heartbeat()
@@ -1091,6 +1281,7 @@ class ChatPage(QWidget):
             w = self._active_plan_worker = PlanWorker(url, model, text, num_ctx, parent=self)
             w.plan_ready.connect(self._on_plan_ready)
             w.plan_error.connect(self._on_worker_error)
+            w.finished.connect(w.deleteLater)
             w.start()
         elif task_type == "both":
             is_low_power = bool(self._settings.get("low_power_mode", False))
@@ -1108,6 +1299,7 @@ class ChatPage(QWidget):
                 cw.compaction_performed.connect(self._on_compaction_performed)
                 cw.chat_finished.connect(lambda full, meta: self._start_sequential_plan(url, model, text, num_ctx, full, meta))
                 cw.chat_error.connect(self._on_worker_error)
+                cw.finished.connect(cw.deleteLater)
                 cw.start()
             else:
                 self.top_bar.show_status("💬 Explaining in chat & 🧠 planning project…")
@@ -1123,11 +1315,13 @@ class ChatPage(QWidget):
                 cw.compaction_performed.connect(self._on_compaction_performed)
                 cw.chat_finished.connect(self._on_chat_finished)
                 cw.chat_error.connect(self._on_worker_error)
+                cw.finished.connect(cw.deleteLater)
                 cw.start()
 
                 pw = self._active_plan_worker = PlanWorker(url, model, text, num_ctx, parent=self)
                 pw.plan_ready.connect(self._on_hybrid_plan_ready)
                 pw.plan_error.connect(lambda err: None)
+                pw.finished.connect(pw.deleteLater)
                 pw.start()
         else:
             if not is_compaction_needed(estimate_messages_tokens(self._messages), num_ctx, threshold_ratio=0.75):
@@ -1144,6 +1338,7 @@ class ChatPage(QWidget):
             cw.compaction_performed.connect(self._on_compaction_performed)
             cw.chat_finished.connect(self._on_chat_finished)
             cw.chat_error.connect(self._on_worker_error)
+            cw.finished.connect(cw.deleteLater)
             cw.start()
 
     def _start_sequential_plan(self, url: str, model: str, text: str, num_ctx: int, full_chat: str, meta: dict) -> None:
@@ -1153,6 +1348,7 @@ class ChatPage(QWidget):
         pw = self._active_plan_worker = PlanWorker(url, model, text, num_ctx, parent=self)
         pw.plan_ready.connect(self._on_hybrid_plan_ready)
         pw.plan_error.connect(lambda err: None)
+        pw.finished.connect(pw.deleteLater)
         pw.start()
 
     @Slot(object)
@@ -1199,6 +1395,13 @@ class ChatPage(QWidget):
         self._save_current_conversation()
         self._cleanup_workers_state()
         self._add_retry_button()
+
+        # Request AI title after plan finishes (avoids model reload race)
+        if not self._current_chat_has_ai_title and self._last_user_prompt:
+            url = self._settings.get("ollama_url", "http://localhost:11434")
+            model = self.top_bar.current_model()
+            num_ctx = getattr(self, "_active_num_ctx", int(self._settings.get("num_ctx", 8192)))
+            self._request_ai_chat_title(self._current_chat_id, self._last_user_prompt, model, url, num_ctx)
 
     @Slot(object)
     def _on_plan_approved(self, plan: CodingPlan) -> None:
@@ -1250,12 +1453,12 @@ class ChatPage(QWidget):
         w.file_completed.connect(self._on_file_checkpoint)
         w.all_completed.connect(self._on_all_files_completed)
         w.worker_error.connect(self._on_build_error)
+        w.finished.connect(w.deleteLater)
         w.start()
 
     def _on_step_started(self, step_num: int, filename: str, total: int) -> None:
         self.top_bar.notify_activity()
         if self._current_chat_id == self._building_chat_id:
-            self.plan_panel.mark_step_completed(step_num)
             pct = int(((step_num - 1) / total) * 100) if total else 0
             self.top_bar.show_status(f"⚙️ [{step_num}/{total}] Writing {filename}…", pct)
 
@@ -1443,6 +1646,13 @@ class ChatPage(QWidget):
         self._cleanup_workers_state()
         self._add_retry_button()
 
+        # Request AI title after chat finishes (avoids model reload race)
+        if not self._current_chat_has_ai_title and self._last_user_prompt:
+            url = self._settings.get("ollama_url", "http://localhost:11434")
+            model = self.top_bar.current_model()
+            num_ctx = getattr(self, "_active_num_ctx", int(self._settings.get("num_ctx", 8192)))
+            self._request_ai_chat_title(self._current_chat_id, self._last_user_prompt, model, url, num_ctx)
+
     @Slot(str)
     def _on_worker_error(self, err_msg: str) -> None:
         self._stop_research_heartbeat()
@@ -1464,10 +1674,6 @@ class ChatPage(QWidget):
             if w and w.isRunning():
                 if hasattr(w, "stop"):
                     w.stop()
-                w.wait(400)
-        for tw in list(self._active_title_workers):
-            if tw.isRunning():
-                tw.wait(200)
         self._active_title_workers.clear()
         self._active_chat_worker = None
         self._active_plan_worker = None
@@ -1539,12 +1745,60 @@ class ChatPage(QWidget):
         save_chat(chat_data)
         self.sidebar.upsert_chat(self._current_chat_id, title)
 
+    def _add_load_earlier_button(self) -> None:
+        """Add a 'Load earlier messages' button at the top of the chat history."""
+        self._remove_load_earlier_button()
+        btn = QPushButton("⬆ Load earlier messages")
+        btn.setObjectName("load_earlier_btn")
+        btn.setStyleSheet(
+            "QPushButton { font-size: 12px; padding: 6px 16px; background: #282c34; "
+            "color: #61afef; border: 1px solid #3e4451; border-radius: 4px; font-weight: bold; }"
+            "QPushButton:hover { background: #3e4451; color: #ffffff; border-color: #61afef; }"
+        )
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(self._on_load_earlier_clicked)
+        # Insert at position 0 (before the stretch and all messages)
+        self.history_layout.insertWidget(0, btn)
+
+    def _remove_load_earlier_button(self) -> None:
+        """Remove existing 'Load earlier' button if present."""
+        for i in range(self.history_layout.count()):
+            item = self.history_layout.itemAt(i)
+            if item and item.widget() and item.widget().objectName() == "load_earlier_btn":
+                w = self.history_layout.takeAt(i).widget()
+                if w:
+                    w.deleteLater()
+                return
+
+    def _on_load_earlier_clicked(self) -> None:
+        """Load 40 more earlier messages into the chat history."""
+        offset = getattr(self, "_lazy_load_offset", 0)
+        if offset <= 0:
+            self._remove_load_earlier_button()
+            return
+        new_offset = max(0, offset - 40)
+        batch = self._messages[new_offset:offset]
+        self._lazy_load_offset = new_offset
+
+        # Remove the old button
+        self._remove_load_earlier_button()
+
+        # Insert messages at the top (after position 0, before existing messages)
+        insert_pos = 0
+        for msg in batch:
+            self.history_layout.insertWidget(insert_pos, ChatMessageWidget(msg["role"], msg["content"]))
+            insert_pos += 1
+
+        # Re-add button if there are still more messages
+        if new_offset > 0:
+            self._add_load_earlier_button()
+
     def _request_ai_chat_title(self, chat_id: str, prompt: str, model: str, url: str, num_ctx: int) -> None:
         """Spawn background TitleWorker to summarize conversation topic."""
         title_model = self._settings.get("summarizer_model") or model
         if not title_model or not url:
             return
-        tw = TitleWorker(chat_id, url, title_model, prompt, num_ctx=min(num_ctx, 4096), parent=self)
+        tw = TitleWorker(chat_id, url, title_model, prompt, num_ctx=num_ctx, parent=self)
         tw.title_ready.connect(self._on_ai_title_ready)
         tw.finished.connect(lambda: self._active_title_workers.remove(tw) if tw in self._active_title_workers else None)
         tw.finished.connect(tw.deleteLater)

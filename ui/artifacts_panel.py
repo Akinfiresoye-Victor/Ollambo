@@ -13,8 +13,10 @@ Features:
 from __future__ import annotations
 
 from pathlib import Path
-from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QFont, QGuiApplication, QIcon
+from core.pathsafe import safe_relpath
+from core import workspace
+from PySide6.QtCore import QTimer, Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QFont, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -49,6 +51,26 @@ class ArtifactsPanel(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
+
+        # Project Info Bar (Workspace title and folder path)
+        proj_bar = QHBoxLayout()
+        self.lbl_project_info = QLabel("")
+        self.lbl_project_info.setStyleSheet("font-size: 12px; color: #98c379;")
+        self.lbl_project_info.setVisible(False)
+        proj_bar.addWidget(self.lbl_project_info)
+        proj_bar.addStretch()
+
+        self.btn_open_folder = QPushButton("📂 Open Folder")
+        self.btn_open_folder.clicked.connect(self._open_project_folder)
+        self.btn_open_folder.setVisible(False)
+        proj_bar.addWidget(self.btn_open_folder)
+
+        self.btn_export_zip = QPushButton("📦 Export .zip")
+        self.btn_export_zip.clicked.connect(self._export_project_zip)
+        self.btn_export_zip.setVisible(False)
+        proj_bar.addWidget(self.btn_export_zip)
+
+        layout.addLayout(proj_bar)
 
         # Header: File selector, title & actions
         top_bar = QHBoxLayout()
@@ -244,27 +266,86 @@ class ArtifactsPanel(QFrame):
         if folder:
             out_dir = Path(folder)
             saved_count = 0
+            unsafe_count = 0
             for name, code in self._files.items():
                 try:
-                    clean_name = name.replace("\\", "/").lstrip("/")
-                    parts = clean_name.split("/")
-                    file_path = out_dir.joinpath(*parts)
+                    clean_rel = safe_relpath(name)
+                except ValueError:
+                    unsafe_count += 1
+                    continue
+                try:
+                    file_path = out_dir / clean_rel
                     file_path.parent.mkdir(parents=True, exist_ok=True)
                     file_path.write_text(code, encoding="utf-8")
                     saved_count += 1
                 except Exception:
                     pass
+            msg = f"Successfully exported {saved_count} files with directory structure to:\n{folder}"
+            if unsafe_count:
+                msg += f"\n\n(Skipped {unsafe_count} unsafe file names)"
             QMessageBox.information(
                 self,
                 "Saved All",
-                f"Successfully exported {saved_count} files with directory structure to:\n{folder}",
+                msg,
             )
 
+    def _open_project_folder(self) -> None:
+        if not getattr(self, "_current_workspace_id", None):
+            return
+        p = workspace.workspace_path(self._current_workspace_id)
+        if p and p.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+
+    def _export_project_zip(self) -> None:
+        if not getattr(self, "_current_workspace_id", None):
+            return
+        ws = workspace.get_workspace(self._current_workspace_id)
+        slug = ws.get("slug", "project") if ws else "project"
+        dest, _ = QFileDialog.getSaveFileName(self, "Export Workspace as ZIP", f"{slug}.zip", "Zip Files (*.zip)")
+        if dest:
+            if workspace.export_zip(self._current_workspace_id, dest):
+                QMessageBox.information(self, "Exported", f"Successfully exported project to:\n{dest}")
+            else:
+                QMessageBox.critical(self, "Export Failed", "Failed to export zip file.")
+
+    def load_workspace(self, workspace_id: str) -> None:
+        """Load all workspace files from disk into the artifacts panel."""
+        self.clear()
+        self._current_workspace_id = workspace_id
+        ws = workspace.get_workspace(workspace_id)
+        if not ws:
+            return
+        p = workspace.workspace_path(workspace_id)
+        folder_str = str(p) if p else ws.get("slug", "")
+        self.lbl_project_info.setText(
+            f"🏷️ <b>{ws.get('name', 'Project')}</b> &nbsp;<span style='color: #7f848e;'>({folder_str})</span>"
+        )
+        self.lbl_project_info.setVisible(True)
+        self.btn_open_folder.setVisible(bool(p and p.exists()))
+        self.btn_export_zip.setVisible(True)
+
+        files = workspace.list_files(workspace_id)
+        for f in files:
+            content = workspace.read_file(workspace_id, f)
+            if content is not None:
+                self.add_file(f, content)
+
+        if files:
+            self.setVisible(True)
+
     def clear(self) -> None:
+        self._current_workspace_id = None
         self._files.clear()
         self._tree_items.clear()
         self.tree.clear()
         self.file_combo.clear()
         self.code_viewer.clear()
         self.lbl_title.setText("📁 Artifacts (0 files)")
+        if hasattr(self, "lbl_project_info"):
+            self.lbl_project_info.clear()
+            self.lbl_project_info.setVisible(False)
+        if hasattr(self, "btn_open_folder"):
+            self.btn_open_folder.setVisible(False)
+        if hasattr(self, "btn_export_zip"):
+            self.btn_export_zip.setVisible(False)
         self.setVisible(False)

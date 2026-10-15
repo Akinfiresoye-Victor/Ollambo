@@ -106,6 +106,8 @@ class ResearchWorker(QThread):
         try:
             if self.stage == "resume":
                 self._run_resume(client)
+            elif self.stage == "continue":
+                self._run_continue(client)
             elif self.stage == "execute":
                 self._run_execute(client)
             elif self.stage == "plan":
@@ -146,8 +148,73 @@ class ResearchWorker(QThread):
         save_plan(self.project_id, plan.to_dict())
         update_index_entry(self.project_id, title=plan.main_question[:80])
 
+        pname = getattr(plan, "project_name", "")
+        if pname:
+            from core.research_store import rename_folder
+            rename_folder(self.project_id, pname)
+
         self.status_message.emit("Research plan ready for review.")
         self.plan_ready.emit(plan, self.project_id)
+
+    def _run_continue(self, client: OllamaClient) -> None:
+        """Continue an existing research project with extra sub-questions."""
+        from core.research_planner import generate_continuation_subquestions, SubQuestion
+        from core.research_store import (
+            load_plan, load_ledger, load_sources, load_notes, save_plan, _project_dir
+        )
+        from core.research_engine import ResearchEngine
+        import shutil
+
+        plan_dict = load_plan(self.project_id)
+        if not plan_dict:
+            self.error.emit(f"Could not load plan for research project {self.project_id}")
+            return
+        self.plan = ResearchPlan.from_dict(plan_dict)
+        ledger = load_ledger(self.project_id)
+        sources = load_sources(self.project_id)
+        notes = load_notes(self.project_id)
+
+        # Keep old report as report.v1.md (or next version)
+        proj_dir = _project_dir(self.project_id)
+        old_report = proj_dir / "report.md"
+        if old_report.exists():
+            v = 1
+            while (proj_dir / f"report.v{v}.md").exists():
+                v += 1
+            try:
+                shutil.copy2(str(old_report), str(proj_dir / f"report.v{v}.md"))
+            except Exception:
+                pass
+
+        old_total = len(self.plan.sub_questions)
+        self.status_message.emit("Formulating follow-up research questions…")
+        extra_sqs = generate_continuation_subquestions(
+            self.plan, ledger, self.topic, self.ollama_url, self.model, num_ctx=self.num_ctx, client=client
+        )
+        self.plan.sub_questions.extend(extra_sqs)
+        save_plan(self.project_id, self.plan.to_dict())
+
+        # Run engine from resume_from_sq = old_total + 1
+        engine = ResearchEngine(
+            project_id=self.project_id,
+            plan=self.plan,
+            ollama_url=self.ollama_url,
+            model=self.model,
+            num_ctx=self.num_ctx,
+            depth=self.depth,
+            progress_cb=self._on_engine_progress,
+            stop_flag=self._is_stopped,
+            client=client,
+            topic=self.topic,
+        )
+        engine.sources = sources
+        engine.sources_map = {s["id"]: s for s in sources if "id" in s}
+        engine.ledger = ledger
+        engine.notes = notes
+
+        engine.run_all(resume_from_sq=old_total + 1)
+        if not self._is_stopped():
+            self._run_writer(client, engine.sources, engine.ledger, engine.dropped_quotes_count)
 
     def _run_execute(self, client: OllamaClient) -> None:
         """Execute research with an approved plan."""

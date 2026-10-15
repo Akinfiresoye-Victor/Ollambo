@@ -442,9 +442,26 @@ def extract_evidence_from_source(
     if not text:
         return []
 
-    # Token budget trimming
+    # Token budget trimming using chunk_and_rank in score order
     budget = input_budget(num_ctx, fraction=0.55)
-    trimmed_text = trim_text_to_budget(text, budget_tokens=budget - 200)
+    max_tokens = budget - 200
+    ranked = chunk_and_rank(question, [{"text": text, "url": url, "title": source.get("title", "")}], chunk_words=200, top_k=20)
+    if ranked:
+        selected_chunks = []
+        accum_tokens = 0
+        for rc in ranked:
+            c_text = rc.get("text", "").strip()
+            if not c_text:
+                continue
+            c_toks = len(c_text) // 4 + 1
+            if accum_tokens + c_toks > max_tokens and selected_chunks:
+                break
+            selected_chunks.append(c_text)
+            accum_tokens += c_toks
+        trimmed_text = "\n\n[...]\n\n".join(selected_chunks)
+        trimmed_text = trim_text_to_budget(trimmed_text, budget_tokens=max_tokens)
+    else:
+        trimmed_text = trim_text_to_budget(text, budget_tokens=max_tokens)
 
     user_msg = (
         f"## Research Sub-Question\n{question}\n\n"
@@ -640,6 +657,7 @@ class ResearchEngine:
         # State
         self.sources: list[dict] = []
         self.sources_map: dict[int, dict] = {}
+        self._shingles_cache: dict[int, set[tuple[str, ...]]] = {}
         self.notes: list[dict] = []
         self.ledger: list[dict] = []
         self.dropped_quotes_count: int = 0
@@ -820,12 +838,19 @@ class ResearchEngine:
                     f"ℹ️ Site renders with JavaScript — limited static info extracted from {domain}",
                 )
 
-            # Check near-duplicates against existing sources
+            # Check near-duplicates against existing sources using cached shingles
             duplicate = False
+            curr_shingles = get_word_shingles(text)
             for prev in self.sources:
-                if are_near_duplicates(text, prev.get("text", "")):
-                    duplicate = True
-                    break
+                prev_id = prev.get("id", 0)
+                prev_shingles = self._shingles_cache.get(prev_id)
+                if prev_shingles is None:
+                    prev_shingles = self._shingles_cache[prev_id] = get_word_shingles(prev.get("text", ""))
+                if curr_shingles and prev_shingles:
+                    sim = len(curr_shingles & prev_shingles) / len(curr_shingles | prev_shingles)
+                    if sim >= 0.50:
+                        duplicate = True
+                        break
             if duplicate:
                 continue
 
@@ -833,6 +858,7 @@ class ResearchEngine:
             cred, reason = credibility_score(url, text)
 
             source_id = len(self.sources) + 1
+            self._shingles_cache[source_id] = curr_shingles
             source_entry = {
                 "id": source_id,
                 "url": url,

@@ -123,10 +123,17 @@ _UNCLOSED_FENCE_PATTERN = re.compile(r"```([a-zA-Z0-9_\-\+]*)\n?(.*)$", re.DOTAL
 class ChatMessageWidget(QFrame):
     """Displays a single user or assistant chat message with formatted Markdown and stable streaming."""
 
-    def __init__(self, role: str, content: str = "", parent=None) -> None:
+    def __init__(
+        self,
+        role: str,
+        content: str = "",
+        attachments: list[dict] | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.role = role
         self._content = content
+        self._attachments = attachments or []
         self._blocks: list[dict] = []
         self._placeholder: QLabel | None = None
         self._parsed_raw = ""
@@ -180,6 +187,21 @@ class ChatMessageWidget(QFrame):
         self._layout.addWidget(self._content_container)
 
         self.set_content(content, is_final=bool(content))
+
+        # Attachment chips if present
+        if self._attachments:
+            att_row = QHBoxLayout()
+            att_row.setSpacing(6)
+            for att in self._attachments:
+                name = att.get("name", "Project")
+                chip = QLabel(f"📎 {name}")
+                chip.setStyleSheet(
+                    "background-color: #2c313a; color: #61afef; border: 1px solid #3e4451; "
+                    "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: bold;"
+                )
+                att_row.addWidget(chip)
+            att_row.addStretch()
+            self._layout.addLayout(att_row)
 
     def get_content(self) -> str:
         return self._content

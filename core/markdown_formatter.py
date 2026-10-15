@@ -30,17 +30,15 @@ _QUOTE_PATTERN = re.compile(r"^>\s*(.*)$")
 # Pre-compiled inline formatting patterns (avoids re.compile on every token flush)
 _INLINE_CODE = re.compile(r"`([^`]+)`")
 _BOLD_STAR = re.compile(r"\*\*([^*]+)\*\*")
-_BOLD_UNDER = re.compile(r"__([^_]+)__")
+_BOLD_UNDER = re.compile(r"(?<!\w)__(?!\w+__(?!\w))([^_]+)__(?!\w)")
 _ITALIC_STAR = re.compile(r"(?<!\*)\*([^*]+)\*(?!\*)")
-_ITALIC_UNDER = re.compile(r"(?<!_)_([^_]+)_(?!_)")
+_ITALIC_UNDER = re.compile(r"(?<!\w)_([^_]+)_(?!\w)")
 _LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 # Pre-built replacement strings
-_INLINE_CODE_REPL = r"<span style='background-color: #282c34; color: #98c379; padding: 1px 5px; border: 1px solid #333842; border-radius: 3px; font-family: Consolas, monospace; font-size: 12px;'>\1</span>"
 _BOLD_REPL = r"<b style='color: #e5c07b; font-weight: bold;'>\1</b>"
 _ITALIC_STAR_REPL = r"<i style='color: #d19a66;'>\1</i>"
 _ITALIC_UNDER_REPL = r"<i style='color: #d19a66;'>\1</i>"
-_LINK_REPL = r"<a href='\2' style='color: #61afef; text-decoration: underline; font-weight: bold;'>\1</a>"
 
 
 def _format_inline(raw_text: str) -> str:
@@ -48,19 +46,42 @@ def _format_inline(raw_text: str) -> str:
     # 1. Escape HTML special characters
     safe = html.escape(raw_text, quote=False)
 
-    # 2. Inline code: `code` (protect inside spans)
-    safe = _INLINE_CODE.sub(_INLINE_CODE_REPL, safe)
+    # 2. Protect inline code spans so formatting never runs inside them
+    code_spans: list[str] = []
+
+    def save_code(m: re.Match) -> str:
+        idx = len(code_spans)
+        span_html = (
+            f"<span style='background-color: #282c34; color: #98c379; padding: 1px 5px; "
+            f"border: 1px solid #333842; border-radius: 3px; font-family: Consolas, monospace; "
+            f"font-size: 12px;'>{m.group(1)}</span>"
+        )
+        code_spans.append(span_html)
+        return f"\x00INLINE_CODE_{idx}\x00"
+
+    safe = _INLINE_CODE.sub(save_code, safe)
 
     # 3. Bold: **text** or __text__
     safe = _BOLD_STAR.sub(_BOLD_REPL, safe)
     safe = _BOLD_UNDER.sub(_BOLD_REPL, safe)
 
-    # 4. Italic: *text* or _text_
+    # 4. Italic: *text* or _text_ (underscores only at word boundaries)
     safe = _ITALIC_STAR.sub(_ITALIC_STAR_REPL, safe)
     safe = _ITALIC_UNDER.sub(_ITALIC_UNDER_REPL, safe)
 
-    # 5. Markdown Links: [text](url)
-    safe = _LINK.sub(_LINK_REPL, safe)
+    # 5. Markdown Links: [text](url) - only allow http and https
+    def replace_link(m: re.Match) -> str:
+        link_text = m.group(1)
+        target = m.group(2).strip()
+        if re.match(r"^https?://", target, re.IGNORECASE):
+            return f"<a href='{target}' style='color: #61afef; text-decoration: underline; font-weight: bold;'>{link_text}</a>"
+        return m.group(0)
+
+    safe = _LINK.sub(replace_link, safe)
+
+    # 6. Restore protected inline code spans
+    for idx, span_html in enumerate(code_spans):
+        safe = safe.replace(f"\x00INLINE_CODE_{idx}\x00", span_html)
 
     return safe
 

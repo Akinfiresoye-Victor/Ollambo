@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLineEdit,
@@ -118,6 +119,16 @@ class SettingsDialog(QDialog):
         self.auto_approve_research_check.setChecked(bool(self._settings.get("auto_approve_research_plans", False)))
         form.addRow("Research Plans:", self.auto_approve_research_check)
 
+        # 12. Workspaces directory (override default)
+        ws_layout = QHBoxLayout()
+        self.workspaces_dir_edit = QLineEdit(str(self._settings.get("workspaces_dir", "")))
+        self.workspaces_dir_edit.setPlaceholderText("Default: <data_dir>/workspaces")
+        ws_browse_btn = QPushButton("Browse...")
+        ws_browse_btn.clicked.connect(self._on_browse_workspaces_dir)
+        ws_layout.addWidget(self.workspaces_dir_edit)
+        ws_layout.addWidget(ws_browse_btn)
+        form.addRow("Workspaces Directory:", ws_layout)
+
         layout.addLayout(form)
         layout.addSpacing(10)
 
@@ -136,6 +147,11 @@ class SettingsDialog(QDialog):
 
         layout.addLayout(btn_layout)
 
+    def _on_browse_workspaces_dir(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "Select Workspaces Directory", self.workspaces_dir_edit.text().strip())
+        if chosen:
+            self.workspaces_dir_edit.setText(chosen)
+
     def _on_save(self) -> None:
         """Saves values into settings dict and persists to disk."""
         self._settings["ollama_url"] = self.url_edit.text().strip().rstrip("/")
@@ -149,6 +165,7 @@ class SettingsDialog(QDialog):
         self._settings["keep_alive"] = self.keep_alive_edit.text().strip() or "3m"
         self._settings["internet_access"] = self.internet_access_check.isChecked()
         self._settings["auto_approve_research_plans"] = self.auto_approve_research_check.isChecked()
+        self._settings["workspaces_dir"] = self.workspaces_dir_edit.text().strip()
 
         save_settings(self._settings)
         self.accept()

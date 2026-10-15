@@ -29,11 +29,12 @@ SUMMARIZER_USER = (
 PLANNER_SYSTEM = (
     "You are a senior software architect. The user will describe a coding "
     "task. Return a structured plan as JSON with these keys:\n"
+    '  "project_name": short human-readable name of 2 to 4 words,\n'
     '  "goal": one-sentence summary of what to build,\n'
     '  "assumptions": list of assumptions you are making,\n'
     '  "files": list of relative file paths to create or modify (use clean folder structures where appropriate, e.g. "src/main.py", "utils/helpers.py", "tests/test_core.py"),\n'
     '  "steps": ordered list of objects, each with "step" (number), '
-    '"description" (what to do), and "file" (which file path this step produces).\n'
+    '"description" (what to do), "file" (which file path this step produces), and "action" ("create" or "modify").\n'
     "Return ONLY valid JSON, nothing else."
 )
 
@@ -62,6 +63,19 @@ CODE_WRITER_USER = (
     "## Your task\n"
     "Write step {step}: file `{file}`.\n"
     "Output ONLY the file contents in a single code fence."
+)
+
+# Template for modifying existing files: preserves unchanged parts
+CODE_EDITOR_USER = (
+    "## Plan\n{plan}\n\n"
+    "## Project so far\n{signatures}\n\n"
+    "## Your task\n"
+    "Modify existing file `{file}` according to step {step}:\n"
+    "{step_desc}\n\n"
+    "## Current File Content for `{file}`\n"
+    "```\n{existing_content}\n```\n\n"
+    "Output the COMPLETE updated file inside a single code fence. "
+    "Preserve all unchanged code, structure, and functions exactly."
 )
 
 
@@ -122,7 +136,8 @@ RESEARCH_PLAN_SYSTEM = (
     "   - 'evidence_for': what concrete findings would support this\n"
     "   - 'evidence_against': what findings would disprove this\n"
     "   - 'preferred_sources': types of sources (e.g. academic papers, official docs, primary data)\n"
-    "5. Include a 'skeptic_checklist' with:\n"
+    "5. Include a 'project_name': short human-readable name of 2 to 4 words.\n"
+    "6. Include a 'skeptic_checklist' with:\n"
     "   - 'myths': common myths or misconceptions about this topic\n"
     "   - 'biases': potential biases in published literature (commercial, ideological, recency)\n"
     "   - 'claims_needing_proof': key assertions that require extra verification\n\n"

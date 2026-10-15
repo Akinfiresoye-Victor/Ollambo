@@ -56,6 +56,7 @@ class CodeWorker(QThread):
         start_step: int = 1,
         existing_files: dict[str, str] | None = None,
         low_power: bool = False,
+        workspace_id: str | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -68,9 +69,17 @@ class CodeWorker(QThread):
         self._max_agents = 1 if low_power else max(1, max_agents)
         self._auto_test = auto_test
         self._start_step = start_step
+        self._workspace_id = workspace_id
         self._stop = False
         self._lock = threading.Lock()
-        self._generated_files: dict[str, str] = dict(existing_files or {})
+
+        init_files: dict[str, str] = {}
+        if workspace_id:
+            from core import workspace
+            init_files.update(workspace.read_all(workspace_id))
+        if existing_files:
+            init_files.update(existing_files)
+        self._generated_files: dict[str, str] = init_files
 
     def stop(self) -> None:
         """Cancel code generation immediately."""
@@ -107,6 +116,11 @@ class CodeWorker(QThread):
                             with self._lock:
                                 curr_files = dict(self._generated_files)
 
+                            existing_content = curr_files.get(step.file)
+                            if not existing_content and self._workspace_id:
+                                from core import workspace
+                                existing_content = workspace.read_file(self._workspace_id, step.file)
+
                             code = generate_single_file(
                                 ollama_url=self._url,
                                 model=self._model,
@@ -118,10 +132,11 @@ class CodeWorker(QThread):
                                 on_progress=lambda part, max_p: self.part_started.emit(step.file, part, max_p),
                                 stop_flag=lambda: self._stop,
                                 client=client,
+                                existing_content=existing_content,
+                                on_status=lambda s: self.test_progress.emit(step.file, s),
                             )
 
                             if self._stop:
-                                work_queue.task_done()
                                 return
 
                             # Self-healing test phase if enabled
@@ -142,8 +157,12 @@ class CodeWorker(QThread):
                                 )
 
                             if self._stop:
-                                work_queue.task_done()
                                 return
+
+                            # Write to workspace before emitting file_completed
+                            if self._workspace_id and code:
+                                from core import workspace
+                                workspace.write_file(self._workspace_id, step.file, code)
 
                             with self._lock:
                                 self._generated_files[step.file] = code

@@ -16,9 +16,10 @@ import os
 import re
 from typing import Callable
 
+from core.context_manager import estimate_tokens
 from core.ollama_client import OllamaClient
 from core.planner import CodingPlan, PlanStep
-from core.prompts import CODE_WRITER_SYSTEM, CODE_WRITER_USER, CONTINUATION_PROMPT
+from core.prompts import CODE_EDITOR_USER, CODE_WRITER_SYSTEM, CODE_WRITER_USER, CONTINUATION_PROMPT
 
 
 def extract_python_signatures(code: str) -> str:
@@ -62,15 +63,26 @@ def build_project_summary(generated_files: dict[str, str]) -> str:
 
 
 def clean_code_fence(text: str) -> str:
-    """Extract the raw code contents from markdown code fences ```...```."""
+    """Extract the raw code contents from markdown code fences ```...```.
+
+    Strips only the outermost fence (first opening fence and last closing fence)
+    so inner fenced code blocks in markdown or documentation remain intact.
+    """
     cleaned = text.strip("\r\n")
-    match = re.search(r"```[a-zA-Z0-9_\-\.\/]*\n(.*?)```", cleaned, re.DOTALL)
-    if match:
-        return match.group(1).rstrip()
+    first_match = re.search(r"```[a-zA-Z0-9_\-\.\/]*\n", cleaned)
+    if first_match:
+        start_idx = first_match.end()
+        last_fence_idx = cleaned.rfind("```")
+        if last_fence_idx >= start_idx:
+            return cleaned[start_idx:last_fence_idx].rstrip()
+        return cleaned[start_idx:].rstrip()
+
     if cleaned.strip().startswith("```"):
         first_newline = cleaned.find("\n")
         if first_newline != -1:
             cleaned = cleaned[first_newline + 1 :]
+        else:
+            cleaned = cleaned.strip()[3:]
     if cleaned.rstrip().endswith("```"):
         last_idx = cleaned.rfind("```")
         cleaned = cleaned[:last_idx]
@@ -124,6 +136,8 @@ def generate_single_file(
     on_progress: Callable[[int, int], None] | None = None,
     stop_flag: Callable[[], bool] | None = None,
     client: OllamaClient | None = None,
+    existing_content: str | None = None,
+    on_status: Callable[[str], None] | None = None,
 ) -> str:
     """Generate source code for a file, continuing automatically if output is cut off."""
     own_client = False
@@ -136,12 +150,36 @@ def generate_single_file(
     )
     signatures = build_project_summary(generated_files)
 
-    prompt = CODE_WRITER_USER.format(
-        plan=plan_desc,
-        signatures=signatures,
-        step=step.step,
-        file=step.file,
-    )
+    step_action = getattr(step, "action", "create")
+    if step_action == "modify" and existing_content:
+        file_tokens = estimate_tokens(existing_content)
+        max_file_tokens = int(num_ctx * 0.35)
+        if file_tokens > max_file_tokens:
+            if on_status:
+                on_status(f"File `{step.file}` exceeds 35% context budget ({file_tokens} tokens). Truncating to signatures and key regions.")
+            sigs = extract_python_signatures(existing_content) if step.file.endswith(".py") else ""
+            lines = existing_content.splitlines()
+            head = "\n".join(lines[:40])
+            tail = "\n".join(lines[-40:]) if len(lines) > 40 else ""
+            content_to_use = f"{sigs}\n\n# --- Head region ---\n{head}\n\n# --- Tail region ---\n{tail}"
+        else:
+            content_to_use = existing_content
+
+        prompt = CODE_EDITOR_USER.format(
+            plan=plan_desc,
+            signatures=signatures,
+            step=step.step,
+            file=step.file,
+            step_desc=step.description,
+            existing_content=content_to_use,
+        )
+    else:
+        prompt = CODE_WRITER_USER.format(
+            plan=plan_desc,
+            signatures=signatures,
+            step=step.step,
+            file=step.file,
+        )
 
     system_msg = {"role": "system", "content": CODE_WRITER_SYSTEM}
     original_task_msg = {"role": "user", "content": prompt}
@@ -218,6 +256,13 @@ def generate_single_file(
                     break
 
             accumulated = stitch_continuation(accumulated, "".join(chunks))
+
+        # Safety guard for modified files
+        if step_action == "modify" and existing_content:
+            if len(accumulated.strip()) < len(existing_content.strip()) * 0.4:
+                if on_status:
+                    on_status(f"⚠️ Warning: Modified `{step.file}` was >60% shorter than original. Preserving original content.")
+                return existing_content
 
         return accumulated
     finally:

@@ -30,6 +30,31 @@ class TestMarkdownFormatter(unittest.TestCase):
         self.assertIn("<a href='https://test.com'", html)
         self.assertIn("link", html)
 
+    def test_code_span_protection(self):
+        text = "Check `**not_bold**` and `*not_italic*` and `[not_link](https://test.com)`."
+        html = markdown_to_html(text)
+        self.assertNotIn("<b ", html)
+        self.assertNotIn("<i ", html)
+        self.assertNotIn("<a ", html)
+        self.assertIn("**not_bold**", html)
+        self.assertIn("*not_italic*", html)
+
+    def test_snake_case_and_dunder_preserved(self):
+        text = "Use snake_case_words and __init__ in Python, but _this is italic_."
+        html = markdown_to_html(text)
+        self.assertIn("snake_case_words", html)
+        self.assertIn("__init__", html)
+        self.assertIn("<i style=", html)
+        self.assertIn("this is italic", html)
+
+    def test_link_schemes(self):
+        text = "[safe](http://example.com) [also_safe](https://example.com) [unsafe](javascript:alert(1)) [file](file:///etc/passwd)"
+        html = markdown_to_html(text)
+        self.assertIn("<a href='http://example.com'", html)
+        self.assertIn("<a href='https://example.com'", html)
+        self.assertNotIn("<a href='javascript", html)
+        self.assertNotIn("<a href='file", html)
+
     def test_markdown_lists(self):
         text = "- Item One\n- Item Two\n- Item Three"
         html = markdown_to_html(text)

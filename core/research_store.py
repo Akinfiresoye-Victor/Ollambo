@@ -52,7 +52,17 @@ def _research_root() -> Path:
 
 
 def _project_dir(project_id: str) -> Path:
-    p = _research_root() / project_id
+    # Resolve folder using index entry 'folder', falling back to project_id for old projects
+    root = _research_root()
+    entries = _load_index()
+    for e in entries:
+        if e.get("id") == project_id:
+            folder = e.get("folder")
+            if folder:
+                p = root / folder
+                p.mkdir(parents=True, exist_ok=True)
+                return p
+    p = root / project_id
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -90,10 +100,15 @@ def list_projects() -> list[dict]:
 
 def create_project(topic: str, depth: str = "standard") -> str:
     """Create a new project folder and index entry. Returns the project id."""
+    from core.workspace import slugify, unique_slug
     project_id = str(uuid.uuid4())
+    root = _research_root()
+    base_slug = slugify(topic)
+    folder = unique_slug(root, base_slug)
     now = datetime.now().isoformat()
     entry = {
         "id": project_id,
+        "folder": folder,
         "title": topic[:80],
         "topic": topic,
         "date": now,
@@ -103,11 +118,34 @@ def create_project(topic: str, depth: str = "standard") -> str:
         "completed_sq": 0,
         "total_sq": 0,
     }
-    _project_dir(project_id)  # ensure dir exists
+    p = root / folder
+    p.mkdir(parents=True, exist_ok=True)
     idx = _load_index()
     idx.append(entry)
     _save_index(idx)
     return project_id
+
+
+def rename_folder(project_id: str, new_name: str) -> str | None:
+    """Safely rename the project folder right after plan generation."""
+    from core.workspace import slugify, unique_slug
+    root = _research_root()
+    base_slug = slugify(new_name)
+    target_folder = unique_slug(root, base_slug)
+    old_dir = _project_dir(project_id)
+    new_dir = root / target_folder
+
+    if old_dir.exists() and old_dir.resolve() != new_dir.resolve():
+        try:
+            old_dir.rename(new_dir)
+        except Exception:
+            try:
+                shutil.move(str(old_dir), str(new_dir))
+            except Exception:
+                return None
+
+    update_index_entry(project_id, folder=target_folder, title=new_name[:80])
+    return target_folder
 
 
 def update_index_entry(project_id: str, **kwargs: Any) -> None:
@@ -122,9 +160,12 @@ def update_index_entry(project_id: str, **kwargs: Any) -> None:
 
 def delete_project(project_id: str) -> None:
     """Delete a project folder and remove from index."""
-    proj_dir = _research_root() / project_id
+    proj_dir = _project_dir(project_id)
     if proj_dir.exists():
         shutil.rmtree(proj_dir, ignore_errors=True)
+    legacy = _research_root() / project_id
+    if legacy.exists():
+        shutil.rmtree(legacy, ignore_errors=True)
     idx = [e for e in _load_index() if e["id"] != project_id]
     _save_index(idx)
 

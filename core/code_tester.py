@@ -20,6 +20,7 @@ from typing import Callable
 
 from core.code_writer import clean_code_fence
 from core.ollama_client import OllamaClient
+from core.pathsafe import safe_relpath
 from core.prompts import CODE_FIXER_USER, CODE_TESTER_SYSTEM
 
 
@@ -78,10 +79,16 @@ def run_automated_tests(
     all_files: dict[str, str] | None = None,
 ) -> tuple[bool, str]:
     """
-    Perform deep static and dry-run tests on generated code.
+    Perform deep static tests on generated code.
     Returns (passed, diagnostic_message).
     """
-    # 1. Syntax check first
+    # 0. Validate filename safety
+    try:
+        safe_relpath(filename)
+    except ValueError as e:
+        return False, f"Invalid or unsafe filename `{filename}`: {e}"
+
+    # 1. Syntax check first (ast.parse and compile)
     valid, err = validate_syntax(filename, code)
     if not valid:
         return False, err
@@ -95,40 +102,6 @@ def run_automated_tests(
     for pattern, warning in placeholder_patterns:
         if re.search(pattern, code, re.IGNORECASE):
             return False, f"Quality check failed in `{filename}`: {warning}"
-
-    # 3. Dry-run test for Python files containing tests or self-contained scripts
-    if filename.endswith(".py") and ("unittest" in code or "pytest" in code or "__main__" in code):
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmp_path = Path(tmpdir)
-                parts = [p for p in filename.replace("\\", "/").split("/") if p and p != "."]
-                target = tmp_path.joinpath(*parts)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(code, encoding="utf-8")
-
-                if all_files:
-                    for dep_name, dep_code in all_files.items():
-                        if dep_name != filename:
-                            dep_parts = [p for p in dep_name.replace("\\", "/").split("/") if p and p != "."]
-                            dep_path = tmp_path.joinpath(*dep_parts)
-                            dep_path.parent.mkdir(parents=True, exist_ok=True)
-                            dep_path.write_text(dep_code, encoding="utf-8")
-
-                import os, subprocess
-                env = dict(os.environ)
-                env["PYTHONPATH"] = str(tmp_path)
-                res = subprocess.run(
-                    [sys.executable, "-m", "py_compile", str(target)],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    cwd=str(tmp_path),
-                    env=env,
-                )
-                if res.returncode != 0:
-                    return False, f"py_compile failed for `{filename}`:\n{res.stderr.strip()}"
-        except Exception:
-            pass
 
     return True, "All tests passed successfully."
 

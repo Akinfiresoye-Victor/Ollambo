@@ -87,6 +87,38 @@ _registry.register_tool(
 )
 
 
+def _lazy_workspace_list_files(workspace_id: str) -> list[str]:
+    from core.workspace import list_files  # noqa: PLC0415
+    return list_files(workspace_id)
+
+
+def _lazy_workspace_read_file(workspace_id: str, relpath: str) -> str:
+    from core.workspace import read_file  # noqa: PLC0415
+    return read_file(workspace_id, relpath) or ""
+
+
+def _lazy_workspace_write_file(workspace_id: str, relpath: str, content: str) -> bool:
+    from core.workspace import write_file  # noqa: PLC0415
+    return write_file(workspace_id, relpath, content)
+
+
+_registry.register_tool(
+    name="workspace_list_files",
+    function=_lazy_workspace_list_files,
+    description="List all relative file paths inside a project workspace. Args: workspace_id(str).",
+)
+_registry.register_tool(
+    name="workspace_read_file",
+    function=_lazy_workspace_read_file,
+    description="Read file content from a project workspace. Args: workspace_id(str), relpath(str).",
+)
+_registry.register_tool(
+    name="workspace_write_file",
+    function=_lazy_workspace_write_file,
+    description="Write file content into a project workspace atomically. Args: workspace_id(str), relpath(str), content(str).",
+)
+
+
 def get_registry() -> ToolsRegistry:
     """Return the shared ToolsRegistry singleton."""
     return _registry

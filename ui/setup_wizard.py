@@ -42,9 +42,10 @@ class SetupWizard(QWidget):
     #   (installed_models: list[str], server_started_by_us: bool)
     setup_complete = Signal(list, bool)
 
-    def __init__(self, ollama_url: str, parent=None) -> None:
+    def __init__(self, ollama_url: str, setup_done: bool = False, parent=None) -> None:
         super().__init__(parent)
         self._ollama_url = ollama_url
+        self._setup_done = setup_done
         self._setup_worker: SetupWorker | None = None
         self._install_worker: InstallWorker | None = None
         self._pull_worker: PullWorker | None = None
@@ -210,6 +211,8 @@ class SetupWizard(QWidget):
             self._btn_continue.setEnabled(True)
             self._install_section.setVisible(False)
             self._model_section.setVisible(False)
+            if getattr(self, "_setup_done", False):
+                self._on_continue()
         else:
             # Figure out what failed and show the right action section.
             if _FAIL in self._lbl_installed.text():

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +86,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "num_thread": None,           # None = let Ollama choose optimal threads
     "internet_access": False,     # OFF by default — web research is opt-in only
     "auto_approve_research_plans": False, # Auto-approve deep research plans
+    "workspaces_dir": "",         # Empty = default <data_dir>/workspaces
 }
 
 
@@ -308,14 +310,17 @@ def save_settings(settings: dict[str, Any]) -> None:
 # Each chat is one JSON file: { "id": "...", "title": "...", "messages": [...] }
 # Messages follow Ollama's format: {"role": "user"|"assistant"|"system", "content": "..."}
 
-def list_chats() -> list[dict[str, str]]:
-    """Return a list of {id, title} dicts for every saved chat, newest first.
+def _chat_index_path() -> Path:
+    return _chats_dir() / "index.json"
 
-    Automatically cleans up empty ghost chat files (no messages and no artifacts).
-    """
+
+def _rebuild_chat_index() -> list[dict[str, Any]]:
+    """Scan the chats directory, prune ghost chats, and build a fresh index."""
     chats_dir = _chats_dir()
-    result = []
+    entries: list[dict[str, Any]] = []
     for p in sorted(chats_dir.glob("*.json"), key=os.path.getmtime, reverse=True):
+        if p.name == "index.json":
+            continue
         try:
             with open(p, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -323,10 +328,45 @@ def list_chats() -> list[dict[str, str]]:
             if not data.get("messages") and not data.get("artifacts"):
                 p.unlink(missing_ok=True)
                 continue
-            result.append({"id": p.stem, "title": data.get("title", "Untitled")})
+            mtime = p.stat().st_mtime
+            entries.append({
+                "id": p.stem,
+                "title": data.get("title", "Untitled"),
+                "updated": mtime,
+            })
         except (json.JSONDecodeError, OSError):
             continue
-    return result
+
+    try:
+        _atomic_write(_chat_index_path(), json.dumps(entries, indent=2, ensure_ascii=False))
+    except Exception:
+        pass
+    return entries
+
+
+def _read_chat_index() -> list[dict[str, Any]]:
+    """Read the chat index. If missing or corrupt, rebuild it once by scanning."""
+    idx_path = _chat_index_path()
+    if not idx_path.exists():
+        return _rebuild_chat_index()
+    try:
+        with open(idx_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        return _rebuild_chat_index()
+    except (json.JSONDecodeError, OSError):
+        return _rebuild_chat_index()
+
+
+def list_chats() -> list[dict[str, str]]:
+    """Return a list of {id, title} dicts for every saved chat, newest first.
+
+    Reads from chats/index.json instead of opening every individual chat file.
+    """
+    entries = _read_chat_index()
+    sorted_entries = sorted(entries, key=lambda e: e.get("updated", 0), reverse=True)
+    return [{"id": e["id"], "title": e.get("title", "Untitled")} for e in sorted_entries]
 
 
 def load_chat(chat_id: str) -> dict[str, Any] | None:
@@ -345,22 +385,51 @@ def save_chat(chat: dict[str, Any]) -> None:
     """Save a chat dict to disk (atomic). The chat must have an 'id' key.
 
     Never writes empty conversations to disk to prevent ghost chats.
+    Updates chats/index.json with the new/updated chat.
     """
     if not chat.get("messages") and not chat.get("artifacts"):
         return
     chat_id = chat["id"]
+    title = chat.get("title", "Untitled")
     path = _chats_dir() / f"{chat_id}.json"
     text = json.dumps(chat, indent=2, ensure_ascii=False)
     _atomic_write(path, text)
 
+    # Update index.json
+    now = time.time()
+    entries = _read_chat_index()
+    found = False
+    for entry in entries:
+        if entry.get("id") == chat_id:
+            entry["title"] = title
+            entry["updated"] = now
+            found = True
+            break
+    if not found:
+        entries.append({"id": chat_id, "title": title, "updated": now})
+
+    try:
+        _atomic_write(_chat_index_path(), json.dumps(entries, indent=2, ensure_ascii=False))
+    except Exception:
+        pass
+
 
 def delete_chat(chat_id: str) -> None:
-    """Delete a saved chat file."""
+    """Delete a saved chat file and remove it from chats/index.json."""
     path = _chats_dir() / f"{chat_id}.json"
     try:
         path.unlink(missing_ok=True)
     except OSError:
         pass
+
+    # Update index.json
+    entries = _read_chat_index()
+    new_entries = [e for e in entries if e.get("id") != chat_id]
+    if len(new_entries) != len(entries):
+        try:
+            _atomic_write(_chat_index_path(), json.dumps(new_entries, indent=2, ensure_ascii=False))
+        except Exception:
+            pass
 
 
 # ── Work session persistence (build checkpoints) ─────────────────────────
@@ -403,14 +472,5 @@ def delete_work_session(chat_id: str) -> None:
 
 def list_active_sessions() -> list[str]:
     """Return chat_ids that have an active (incomplete) work session."""
-    result = []
-    for p in _sessions_dir().glob("*.json"):
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not data.get("completed", False):
-                result.append(p.stem)
-        except (json.JSONDecodeError, OSError):
-            continue
-    return result
+    return [p.stem for p in _sessions_dir().glob("*.json")]
 

@@ -25,7 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 from platformdirs import user_data_dir
 
@@ -200,6 +200,9 @@ def _fetch_one(url: str) -> dict | None:
     """Fetch a single URL; returns {url, html} or error dictionary."""
     if not url:
         return None
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https"):
+        return {"url": url, "html": "", "error": f"Blocked non-http URL: {url}"}
     if is_private_address(url):
         return {"url": url, "html": "", "error": "Blocked private or local address"}
 
@@ -217,12 +220,34 @@ def _fetch_one(url: str) -> dict | None:
             ),
             "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
         }
+        current_url = url
+        max_hops = 5
+        hops = 0
+
         with httpx.Client(
             timeout=_FETCH_TIMEOUT,
-            follow_redirects=True,
+            follow_redirects=False,
             headers=headers,
         ) as client:
-            resp = client.get(url)
+            while True:
+                resp = client.get(current_url)
+                if resp.is_redirect:
+                    hops += 1
+                    if hops > max_hops:
+                        return {"url": url, "html": "", "error": "Too many redirects (maximum 5 hops exceeded)"}
+                    loc = resp.headers.get("location", "")
+                    if not loc:
+                        return {"url": url, "html": "", "error": "Redirect missing Location header"}
+                    next_url = urljoin(current_url, loc)
+                    next_scheme = urlparse(next_url).scheme.lower()
+                    if next_scheme not in ("http", "https"):
+                        return {"url": url, "html": "", "error": f"Blocked non-http redirect: {next_url}"}
+                    if is_private_address(next_url):
+                        return {"url": url, "html": "", "error": f"Blocked private or local redirect address: {next_url}"}
+                    current_url = next_url
+                    continue
+                break
+
             if resp.status_code >= 400:
                 return {"url": url, "html": "", "error": f"HTTP status {resp.status_code}"}
             ctype = resp.headers.get("content-type", "")

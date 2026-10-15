@@ -48,7 +48,8 @@ class MainWindow(QMainWindow):
 
         ollama_url = self._settings.get("ollama_url", "http://localhost:11434")
 
-        self._wizard = SetupWizard(ollama_url, parent=self)
+        setup_done = bool(self._settings.get("setup_done", False))
+        self._wizard = SetupWizard(ollama_url, setup_done=setup_done, parent=self)
         self._wizard.setup_complete.connect(self._on_setup_complete)
         self._stack.addWidget(self._wizard)  # index 0
 

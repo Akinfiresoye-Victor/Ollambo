@@ -20,9 +20,11 @@ class ModelsWorker(QThread):
         self._url = ollama_url
 
     def run(self) -> None:
+        client = OllamaClient(self._url)
         try:
-            client = OllamaClient(self._url)
             models = client.list_models()
             self.models_ready.emit(models)
         except Exception as e:
             self.models_error.emit(str(e))
+        finally:
+            client.close()

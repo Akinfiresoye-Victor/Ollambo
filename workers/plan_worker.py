@@ -28,6 +28,7 @@ class PlanWorker(QThread):
         model: str,
         user_request: str,
         num_ctx: int = 8192,
+        existing_context: str | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -35,6 +36,7 @@ class PlanWorker(QThread):
         self._model = model
         self._request = user_request
         self._num_ctx = num_ctx
+        self._existing_context = existing_context
         self._stop = False
 
     def stop(self) -> None:
@@ -51,6 +53,7 @@ class PlanWorker(QThread):
                 num_ctx=self._num_ctx,
                 stop_flag=lambda: self._stop,
                 client=client,
+                existing_context=self._existing_context,
             )
             if self._stop:
                 self.plan_error.emit("Planning cancelled by user.")

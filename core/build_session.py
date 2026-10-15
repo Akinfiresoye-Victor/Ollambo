@@ -13,15 +13,29 @@ from core.storage import (
 )
 
 
-def save_session(chat_id: str, plan: CodingPlan, build_files: dict[str, str], next_step: int) -> None:
+def save_session(
+    chat_id: str,
+    plan: CodingPlan,
+    build_files: dict[str, str],
+    next_step: int,
+    workspace_id: str | None = None,
+) -> None:
     """Persist current build state to disk for crash recovery and resume."""
     session = {
         "chat_id": chat_id,
+        "workspace_id": workspace_id,
+        "project_name": getattr(plan, "project_name", ""),
         "goal": plan.goal,
         "assumptions": plan.assumptions,
         "files": plan.files,
         "steps": [
-            {"step": s.step, "description": s.description, "file": s.file, "completed": s.completed}
+            {
+                "step": s.step,
+                "description": s.description,
+                "file": s.file,
+                "completed": s.completed,
+                "action": getattr(s, "action", "create"),
+            }
             for s in plan.steps
         ],
         "completed_files": build_files,
@@ -47,6 +61,7 @@ def reconstruct_plan(session: dict[str, Any]) -> CodingPlan:
             description=s.get("description", ""),
             file=s.get("file", ""),
             completed=s.get("completed", False),
+            action=s.get("action", "create"),
         )
         for i, s in enumerate(session.get("steps", []))
     ]
@@ -56,6 +71,7 @@ def reconstruct_plan(session: dict[str, Any]) -> CodingPlan:
         files=session.get("files", []),
         steps=steps,
         raw_text=session.get("raw_text", ""),
+        project_name=session.get("project_name", ""),
     )
 
 

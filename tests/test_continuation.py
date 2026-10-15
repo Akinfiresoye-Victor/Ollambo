@@ -39,6 +39,11 @@ class TestCodeContinuation(unittest.TestCase):
         text3 = "    return 100\n```"
         self.assertEqual(clean_code_fence(text3), "    return 100")
 
+        # Markdown file with inner fenced block
+        md_text = "```markdown\n# Project Docs\n\n```python\nprint('inner')\n```\n\nMore docs\n```"
+        expected_md = "# Project Docs\n\n```python\nprint('inner')\n```\n\nMore docs"
+        self.assertEqual(clean_code_fence(md_text), expected_md)
+
     def test_stitch_without_overlap(self) -> None:
         part1 = "def part_one():\n    print('1')\n"
         part2 = "def part_two():\n    print('2')"

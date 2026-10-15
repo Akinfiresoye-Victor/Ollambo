@@ -17,6 +17,7 @@ from core.context_manager import (
     build_compacted_messages,
     build_extractive_summary,
     estimate_messages_tokens,
+    estimate_tokens,
     fallback_truncate_messages,
     generate_summary,
     is_compaction_needed,
@@ -51,6 +52,7 @@ class ChatWorker(QThread):
         messages: list[dict[str, str]],
         options: dict[str, Any] | None = None,
         summarizer_model: str = "",
+        extra_system: str = "",
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -59,6 +61,7 @@ class ChatWorker(QThread):
         self._messages = messages
         self._options = options or {}
         self._summarizer_model = summarizer_model or model
+        self._extra_system = extra_system
         self._stop = False
 
     def stop(self) -> None:
@@ -69,7 +72,8 @@ class ChatWorker(QThread):
         client = OllamaClient(self._url)
         try:
             num_ctx = int(self._options.get("num_ctx", 8192))
-            est_tokens = estimate_messages_tokens(self._messages)
+            extra_tokens = (estimate_tokens(self._extra_system) + 4) if self._extra_system else 0
+            est_tokens = estimate_messages_tokens(self._messages) + extra_tokens
 
             # ── 1. Pre-chat Compaction Check ──────────────────────────────
             payload_messages = self._messages
@@ -98,7 +102,7 @@ class ChatWorker(QThread):
                         summary = build_extractive_summary(to_summarize)
 
                     payload_messages = build_compacted_messages(sys_msgs, summary, recent_msgs)
-                    new_tokens = estimate_messages_tokens(payload_messages)
+                    new_tokens = estimate_messages_tokens(payload_messages) + extra_tokens
                     self.compaction_performed.emit(payload_messages, est_tokens, new_tokens)
 
             if self._stop:
@@ -126,9 +130,13 @@ class ChatWorker(QThread):
 
             keep_alive = get_effective_keep_alive(self._options)
 
+            send_messages = list(payload_messages)
+            if self._extra_system:
+                send_messages.insert(0, {"role": "system", "content": self._extra_system})
+
             stream = client.chat_stream(
                 model=self._model,
-                messages=payload_messages,
+                messages=send_messages,
                 options=chat_opts,
                 stop_flag=lambda: self._stop,
                 keep_alive=keep_alive,

@@ -80,9 +80,12 @@ def is_ollama_installed() -> SetupStatus:
 def is_server_running(base_url: str = "http://localhost:11434") -> SetupStatus:
     """Check if the Ollama server is responding."""
     client = OllamaClient(base_url)
-    if client.is_server_running():
-        return SetupStatus(True, "Server is running")
-    return SetupStatus(False, "Server is not responding")
+    try:
+        if client.is_server_running():
+            return SetupStatus(True, "Server is running")
+        return SetupStatus(False, "Server is not responding")
+    finally:
+        client.close()
 
 
 def get_installed_models(
@@ -97,3 +100,5 @@ def get_installed_models(
         return SetupStatus(False, "No models installed"), []
     except Exception as e:
         return SetupStatus(False, f"Could not list models: {e}"), []
+    finally:
+        client.close()

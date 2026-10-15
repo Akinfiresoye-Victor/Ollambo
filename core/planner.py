@@ -23,6 +23,7 @@ from core.prompts import PLANNER_JSON_RETRY, PLANNER_SYSTEM
 PLAN_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
+        "project_name": {"type": "string"},
         "goal": {"type": "string"},
         "assumptions": {"type": "array", "items": {"type": "string"}},
         "files": {"type": "array", "items": {"type": "string"}},
@@ -34,6 +35,7 @@ PLAN_JSON_SCHEMA: dict[str, Any] = {
                     "step": {"type": "integer"},
                     "description": {"type": "string"},
                     "file": {"type": "string"},
+                    "action": {"type": "string", "enum": ["create", "modify"]},
                 },
                 "required": ["step", "description", "file"],
             },
@@ -49,6 +51,7 @@ class PlanStep:
     description: str
     file: str
     completed: bool = False
+    action: str = "create"
 
 
 @dataclass
@@ -58,6 +61,7 @@ class CodingPlan:
     files: list[str] = field(default_factory=list)
     steps: list[PlanStep] = field(default_factory=list)
     raw_text: str = ""
+    project_name: str = ""
 
 
 def parse_plan_json(text: str) -> CodingPlan | None:
@@ -88,7 +92,13 @@ def parse_plan_json(text: str) -> CodingPlan | None:
     if not isinstance(data, dict):
         return None
 
+    from core.workspace import slugify
+
     goal = str(data.get("goal", "Coding task"))
+    project_name = str(data.get("project_name") or "").strip()
+    if not project_name:
+        project_name = slugify(goal)
+
     assumptions = [str(a) for a in data.get("assumptions", [])]
     files = [str(f) for f in data.get("files", [])]
 
@@ -97,11 +107,15 @@ def parse_plan_json(text: str) -> CodingPlan | None:
     if isinstance(raw_steps, list):
         for idx, s in enumerate(raw_steps, start=1):
             if isinstance(s, dict):
+                act = str(s.get("action", "create")).lower().strip()
+                if act not in ("create", "modify"):
+                    act = "create"
                 steps.append(
                     PlanStep(
                         step=int(s.get("step", idx)),
                         description=str(s.get("description", f"Create {s.get('file', '')}")),
                         file=str(s.get("file", f"file_{idx}.py")),
+                        action=act,
                     )
                 )
 
@@ -111,6 +125,7 @@ def parse_plan_json(text: str) -> CodingPlan | None:
         files=files,
         steps=steps,
         raw_text=text,
+        project_name=project_name,
     )
 
 
@@ -121,6 +136,7 @@ def generate_plan(
     num_ctx: int = 8192,
     stop_flag: Callable[[], bool] | None = None,
     client: OllamaClient | None = None,
+    existing_context: str | None = None,
 ) -> CodingPlan:
     """Call Ollama to generate a structured coding plan with fallback retries."""
     own_client = False
@@ -128,8 +144,21 @@ def generate_plan(
         client = OllamaClient(ollama_url)
         own_client = True
 
+    system_prompt = PLANNER_SYSTEM
+    if existing_context:
+        system_prompt += (
+            "\n\nExisting Project Context:\n"
+            f"{existing_context}\n\n"
+            "INSTRUCTIONS FOR EXISTING PROJECT:\n"
+            "- This request extends the existing project above.\n"
+            "- Keep the same project_name.\n"
+            "- For existing files that need changes, set action to 'modify'.\n"
+            "- For new files being added, set action to 'create'.\n"
+            "- Do NOT recreate files that need no change."
+        )
+
     messages = [
-        {"role": "system", "content": PLANNER_SYSTEM},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_request},
     ]
 

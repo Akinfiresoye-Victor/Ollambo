@@ -40,10 +40,12 @@ class ResearchPlan:
     sub_questions: list[SubQuestion] = field(default_factory=list)
     skeptic_checklist: dict[str, Any] = field(default_factory=dict)
     raw_json: str = ""
+    project_name: str = ""
 
     def to_dict(self) -> dict:
         d = {
             "topic": self.topic,
+            "project_name": self.project_name,
             "main_question": self.main_question,
             "sub_questions": [
                 {
@@ -82,6 +84,7 @@ class ResearchPlan:
             main_question=d.get("main_question", ""),
             sub_questions=sqs,
             skeptic_checklist=d.get("skeptic_checklist", {}),
+            project_name=d.get("project_name", ""),
         )
 
 
@@ -92,6 +95,7 @@ class ResearchPlan:
 _PLAN_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
+        "project_name": {"type": "string"},
         "main_question": {"type": "string"},
         "sub_questions": {
             "type": "array",
@@ -165,13 +169,109 @@ def parse_plan_json(text: str, topic: str) -> ResearchPlan | None:
             preferred_sources=[str(s) for s in sq.get("preferred_sources", [])],
         ))
 
+    pname = str(data.get("project_name", "")).strip()
+
     return ResearchPlan(
         topic=topic,
         main_question=str(data.get("main_question", topic)),
         sub_questions=sqs,
         skeptic_checklist=data.get("skeptic_checklist", {}),
         raw_json=text,
+        project_name=pname,
     )
+
+
+def generate_continuation_subquestions(
+    existing_plan: ResearchPlan,
+    ledger: list[dict],
+    follow_up_prompt: str,
+    ollama_url: str,
+    model: str,
+    num_ctx: int = 8192,
+    client: OllamaClient | None = None,
+) -> list[SubQuestion]:
+    """Generate 2 to 3 extra sub-questions for continuing research on an existing topic."""
+    old_total = len(existing_plan.sub_questions)
+    claims_digest = "\n".join(
+        f"- {item.get('claim', '')} (Confidence: {item.get('confidence', 0)}%)"
+        for item in ledger[:8]
+    ) or "(No ledger claims recorded yet)"
+
+    system_prompt = (
+        "You are a research director expanding an existing research investigation. "
+        "The user wants to follow up or dig deeper into specific aspects.\n\n"
+        f"Existing Topic: {existing_plan.topic}\n"
+        f"Main Question: {existing_plan.main_question}\n\n"
+        f"Known Findings So Far:\n{claims_digest}\n\n"
+        "Generate exactly 2 to 3 NEW, highly targeted sub-questions addressing the follow-up request. "
+        "Do not repeat existing questions. Return JSON matching the sub_questions schema."
+    )
+    user_prompt = f"Follow-up request: {follow_up_prompt}"
+
+    own_client = False
+    if client is None:
+        client = OllamaClient(ollama_url)
+        own_client = True
+
+    try:
+        from core.storage import get_configured_threads
+        gen_opts: dict[str, Any] = {
+            "num_ctx": num_ctx,
+            "temperature": 0.2,
+            "top_p": 0.9,
+        }
+        threads = get_configured_threads()
+        if threads is not None:
+            gen_opts["num_thread"] = threads
+
+        resp = client.chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            options=gen_opts,
+            format_schema={
+                "type": "object",
+                "properties": {
+                    "sub_questions": _PLAN_SCHEMA["properties"]["sub_questions"]
+                },
+                "required": ["sub_questions"],
+            },
+        )
+        content = resp.get("message", {}).get("content", "") if isinstance(resp, dict) else str(resp)
+        parsed = parse_plan_json(content, existing_plan.topic)
+        if parsed and parsed.sub_questions:
+            extra = parsed.sub_questions[:3]
+            for idx, sq in enumerate(extra, start=old_total + 1):
+                sq.index = idx
+            return extra
+    except Exception:
+        pass
+    finally:
+        if own_client:
+            client.close()
+
+    return [
+        SubQuestion(
+            index=old_total + 1,
+            question=f"Investigate: {follow_up_prompt}",
+            why_it_matters="Direct user follow-up inquiry",
+            search_queries=[f"{existing_plan.topic} {follow_up_prompt}", f"{follow_up_prompt} analysis"],
+            evidence_for="Supporting findings",
+            evidence_against="Counter evidence",
+            preferred_sources=["credible sources"],
+        ),
+        SubQuestion(
+            index=old_total + 2,
+            question=f"What are the implications or opposing views regarding {follow_up_prompt}?",
+            why_it_matters="Comprehensive verification",
+            search_queries=[f"{follow_up_prompt} controversy", f"{follow_up_prompt} critique"],
+            evidence_for="Supporting arguments",
+            evidence_against="Critical data",
+            preferred_sources=["expert analysis"],
+        ),
+    ]
 
 
 # ---------------------------------------------------------------------------
