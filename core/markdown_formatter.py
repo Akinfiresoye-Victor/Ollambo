@@ -35,10 +35,58 @@ _ITALIC_STAR = re.compile(r"(?<!\*)\*([^*]+)\*(?!\*)")
 _ITALIC_UNDER = re.compile(r"(?<!\w)_([^_]+)_(?!\w)")
 _LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
-# Pre-built replacement strings
-_BOLD_REPL = r"<b style='color: #e5c07b; font-weight: bold;'>\1</b>"
-_ITALIC_STAR_REPL = r"<i style='color: #d19a66;'>\1</i>"
-_ITALIC_UNDER_REPL = r"<i style='color: #d19a66;'>\1</i>"
+_PALETTE = {
+    "primary": (229, 192, 123),
+    "secondary": (171, 178, 191),
+    "tertiary": (157, 165, 180),
+    "accent": (97, 175, 239),
+    "bold": (229, 192, 123),
+    "italic": (209, 154, 102),
+    "heading_subtle": (152, 195, 121),
+    "code_background": (40, 44, 52),
+    "code_text": (152, 195, 121),
+    "border": (62, 68, 81),
+    "raised": (51, 56, 66),
+}
+_MONO_FONT = "Consolas, monospace"
+
+
+def set_palette(
+    *,
+    primary: tuple[int, int, int] = (229, 192, 123),
+    secondary: tuple[int, int, int] = (171, 178, 191),
+    tertiary: tuple[int, int, int] = (157, 165, 180),
+    accent: tuple[int, int, int] = (97, 175, 239),
+    bold: tuple[int, int, int] = (229, 192, 123),
+    italic: tuple[int, int, int] = (209, 154, 102),
+    heading_subtle: tuple[int, int, int] = (152, 195, 121),
+    code_background: tuple[int, int, int] = (40, 44, 52),
+    code_text: tuple[int, int, int] = (152, 195, 121),
+    border: tuple[int, int, int] = (62, 68, 81),
+    raised: tuple[int, int, int] = (51, 56, 66),
+    mono_font: str = "Consolas, monospace",
+) -> None:
+    """Set rich-text colors without making the core depend on the UI theme."""
+    global _MONO_FONT
+    _PALETTE.update(
+        primary=primary,
+        secondary=secondary,
+        tertiary=tertiary,
+        accent=accent,
+        bold=bold,
+        italic=italic,
+        heading_subtle=heading_subtle,
+        code_background=code_background,
+        code_text=code_text,
+        border=border,
+        raised=raised,
+    )
+    _MONO_FONT = mono_font
+
+
+def _css_color(name: str) -> str:
+    red, green, blue = _PALETTE[name]
+    return f"rgb({red}, {green}, {blue})"
 
 
 def _format_inline(raw_text: str) -> str:
@@ -52,8 +100,10 @@ def _format_inline(raw_text: str) -> str:
     def save_code(m: re.Match) -> str:
         idx = len(code_spans)
         span_html = (
-            f"<span style='background-color: #282c34; color: #98c379; padding: 1px 5px; "
-            f"border: 1px solid #333842; border-radius: 3px; font-family: Consolas, monospace; "
+            f"<span style='background-color: {_css_color('code_background')}; "
+            f"color: {_css_color('code_text')}; padding: 1px 5px; "
+            f"border: 1px solid {_css_color('raised')}; border-radius: 3px; "
+            f"font-family: {_MONO_FONT}; "
             f"font-size: 12px;'>{m.group(1)}</span>"
         )
         code_spans.append(span_html)
@@ -62,19 +112,24 @@ def _format_inline(raw_text: str) -> str:
     safe = _INLINE_CODE.sub(save_code, safe)
 
     # 3. Bold: **text** or __text__
-    safe = _BOLD_STAR.sub(_BOLD_REPL, safe)
-    safe = _BOLD_UNDER.sub(_BOLD_REPL, safe)
+    bold = f"<b style='color: {_css_color('bold')}; font-weight: bold;'>\\1</b>"
+    safe = _BOLD_STAR.sub(bold, safe)
+    safe = _BOLD_UNDER.sub(bold, safe)
 
     # 4. Italic: *text* or _text_ (underscores only at word boundaries)
-    safe = _ITALIC_STAR.sub(_ITALIC_STAR_REPL, safe)
-    safe = _ITALIC_UNDER.sub(_ITALIC_UNDER_REPL, safe)
+    italic = f"<i style='color: {_css_color('italic')};'>\\1</i>"
+    safe = _ITALIC_STAR.sub(italic, safe)
+    safe = _ITALIC_UNDER.sub(italic, safe)
 
     # 5. Markdown Links: [text](url) - only allow http and https
     def replace_link(m: re.Match) -> str:
         link_text = m.group(1)
         target = m.group(2).strip()
         if re.match(r"^https?://", target, re.IGNORECASE):
-            return f"<a href='{target}' style='color: #61afef; text-decoration: underline; font-weight: bold;'>{link_text}</a>"
+            return (
+                f"<a href='{target}' style='color: {_css_color('accent')}; "
+                f"text-decoration: underline; font-weight: bold;'>{link_text}</a>"
+            )
         return m.group(0)
 
     safe = _LINK.sub(replace_link, safe)
@@ -119,7 +174,10 @@ def markdown_to_html(md_text: str) -> str:
         # Horizontal Rule
         if _HR_PATTERN.match(line):
             closed = close_lists()
-            html_lines.append(f"{closed}<hr style='border: none; border-top: 1px solid #3e4451; margin: 8px 0;'>")
+            html_lines.append(
+                f"{closed}<hr style='border: none; border-top: 1px solid "
+                f"{_css_color('border')}; margin: 8px 0;'>"
+            )
             continue
 
         # Headings
@@ -129,13 +187,25 @@ def markdown_to_html(md_text: str) -> str:
             level = len(h_match.group(1))
             heading_text = _format_inline(h_match.group(2))
             if level == 1:
-                html_lines.append(f"{closed}<h1 style='color: #61afef; font-size: 16px; font-weight: bold; margin: 10px 0 4px 0;'>{heading_text}</h1>")
+                html_lines.append(
+                    f"{closed}<h1 style='color: {_css_color('accent')}; font-size: 16px; "
+                    f"font-weight: bold; margin: 10px 0 4px 0;'>{heading_text}</h1>"
+                )
             elif level == 2:
-                html_lines.append(f"{closed}<h2 style='color: #61afef; font-size: 15px; font-weight: bold; margin: 8px 0 3px 0;'>{heading_text}</h2>")
+                html_lines.append(
+                    f"{closed}<h2 style='color: {_css_color('accent')}; font-size: 15px; "
+                    f"font-weight: bold; margin: 8px 0 3px 0;'>{heading_text}</h2>"
+                )
             elif level == 3:
-                html_lines.append(f"{closed}<h3 style='color: #98c379; font-size: 14px; font-weight: bold; margin: 6px 0 2px 0;'>{heading_text}</h3>")
+                html_lines.append(
+                    f"{closed}<h3 style='color: {_css_color('heading_subtle')}; font-size: 14px; "
+                    f"font-weight: bold; margin: 6px 0 2px 0;'>{heading_text}</h3>"
+                )
             else:
-                html_lines.append(f"{closed}<h4 style='color: #e5c07b; font-size: 13px; font-weight: bold; margin: 4px 0 2px 0;'>{heading_text}</h4>")
+                html_lines.append(
+                    f"{closed}<h4 style='color: {_css_color('primary')}; font-size: 13px; "
+                    f"font-weight: bold; margin: 4px 0 2px 0;'>{heading_text}</h4>"
+                )
             continue
 
         # Blockquote
@@ -144,7 +214,9 @@ def markdown_to_html(md_text: str) -> str:
             closed = close_lists()
             q_text = _format_inline(q_match.group(1))
             html_lines.append(
-                f"{closed}<div style='border-left: 3px solid #61afef; margin: 4px 0 4px 6px; padding: 2px 0 2px 10px; color: #abb2bf; font-style: italic;'>{q_text}</div>"
+                f"{closed}<div style='border-left: 3px solid {_css_color('accent')}; "
+                f"margin: 4px 0 4px 6px; padding: 2px 0 2px 10px; "
+                f"color: {_css_color('secondary')}; font-style: italic;'>{q_text}</div>"
             )
             continue
 
@@ -156,7 +228,10 @@ def markdown_to_html(md_text: str) -> str:
                 closed = close_lists()
                 html_lines.append(f"{closed}<ul style='margin: 3px 0 3px 0; padding-left: 18px;'>")
                 in_ul = True
-            html_lines.append(f"<li style='margin: 2px 0; color: #abb2bf; line-height: 1.45;'>{item_text}</li>")
+            html_lines.append(
+                f"<li style='margin: 2px 0; color: {_css_color('secondary')}; "
+                f"line-height: 1.45;'>{item_text}</li>"
+            )
             continue
 
         # Ordered list: 1., 2., etc.
@@ -167,13 +242,19 @@ def markdown_to_html(md_text: str) -> str:
                 closed = close_lists()
                 html_lines.append(f"{closed}<ol style='margin: 3px 0 3px 0; padding-left: 18px;'>")
                 in_ol = True
-            html_lines.append(f"<li style='margin: 2px 0; color: #abb2bf; line-height: 1.45;'>{item_text}</li>")
+            html_lines.append(
+                f"<li style='margin: 2px 0; color: {_css_color('secondary')}; "
+                f"line-height: 1.45;'>{item_text}</li>"
+            )
             continue
 
         # Normal paragraph text
         closed = close_lists()
         p_text = _format_inline(line)
-        html_lines.append(f"{closed}<p style='margin: 3px 0; line-height: 1.5; color: #abb2bf; font-size: 13px;'>{p_text}</p>")
+        html_lines.append(
+            f"{closed}<p style='margin: 3px 0; line-height: 1.5; "
+            f"color: {_css_color('secondary')}; font-size: 13px;'>{p_text}</p>"
+        )
 
     html_lines.append(close_lists())
     return "".join(html_lines)

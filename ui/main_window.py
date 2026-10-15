@@ -14,7 +14,7 @@ from __future__ import annotations
 import subprocess
 from typing import Any
 
-from PySide6.QtCore import Slot
+from PySide6.QtCore import QSettings, Slot
 from PySide6.QtWidgets import (
     QMainWindow,
     QStackedWidget,
@@ -36,7 +36,9 @@ class MainWindow(QMainWindow):
         self._server_started_by_us = False
 
         self.setWindowTitle("Ollambo")
-        self.resize(900, 650)
+        self.setMinimumSize(1040, 680)
+        self.resize(1200, 780)
+        self._ui_settings = QSettings("Ollambo", "Ollambo")
         from core.assets import get_app_icon
         app_icon = get_app_icon()
         if not app_icon.isNull():
@@ -55,6 +57,16 @@ class MainWindow(QMainWindow):
 
         self._chat_page = ChatPage(self._settings, parent=self)
         self._stack.addWidget(self._chat_page)  # index 1
+        geometry = self._ui_settings.value("window/geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        splitter_state = self._ui_settings.value("window/splitter")
+        if splitter_state is not None:
+            self._chat_page.shell_splitter.restoreState(splitter_state)
+        sidebar_collapsed = bool(
+            self._ui_settings.value("window/sidebar_collapsed", False, type=bool)
+        )
+        self._chat_page.set_sidebar_collapsed(sidebar_collapsed)
 
         # ── Decide which page to show first ───────────────────────────
         if self._settings.get("setup_done"):
@@ -93,6 +105,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         """Stop workers and (if we started it) the Ollama server."""
+        self._ui_settings.setValue("window/geometry", self.saveGeometry())
+        self._ui_settings.setValue("window/splitter", self._chat_page.shell_splitter.saveState())
+        self._ui_settings.setValue(
+            "window/sidebar_collapsed", self._chat_page.sidebar_collapsed
+        )
         # Stop any wizard or chat workers.
         self._wizard.stop_workers()
         self._chat_page.stop_workers()

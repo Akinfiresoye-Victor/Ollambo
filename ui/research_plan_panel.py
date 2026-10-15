@@ -27,6 +27,8 @@ from PySide6.QtWidgets import (
 )
 
 from core.research_planner import ResearchPlan, SubQuestion
+from ui.icons import icon
+from ui.theme import set_variant
 
 
 class ResearchPlanPanel(QFrame):
@@ -42,9 +44,7 @@ class ResearchPlanPanel(QFrame):
         super().__init__(parent)
         self._current_plan: ResearchPlan | None = None
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setStyleSheet(
-            "ResearchPlanPanel { background-color: #21252b; border: 1px solid #333842; border-radius: 6px; padding: 6px; }"
-        )
+        self.setObjectName("Card")
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -53,31 +53,46 @@ class ResearchPlanPanel(QFrame):
         layout.setSpacing(6)
 
         # Header Title
-        title = QLabel("🔬 Proposed Research Plan")
-        title.setStyleSheet("font-size: 14px; font-weight: bold; color: #61afef;")
-        layout.addWidget(title)
+        title = QLabel("Proposed research plan")
+        title.setProperty("role", "title")
+        title_row = QHBoxLayout()
+        title_icon = QLabel()
+        title_icon.setPixmap(icon("flask", size=18).pixmap(18, 18))
+        title_row.addWidget(title_icon)
+        title_row.addWidget(title)
+        title_row.addStretch()
+        layout.addLayout(title_row)
 
         # Main Question
         self.lbl_main = QLabel("Main Question: -")
         self.lbl_main.setWordWrap(True)
-        self.lbl_main.setStyleSheet("font-size: 12px; font-weight: bold; color: #abb2bf;")
+        self.lbl_main.setProperty("role", "muted")
         layout.addWidget(self.lbl_main)
+
+        self.empty_state = QWidget()
+        empty_layout = QVBoxLayout(self.empty_state)
+        empty_layout.setContentsMargins(0, 12, 0, 0)
+        self.empty_label = QLabel("No research plan yet. Ask for a topic in Research mode.")
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setProperty("role", "muted")
+        empty_layout.addWidget(self.empty_label)
+        layout.addWidget(self.empty_state)
 
         # Sub-questions label & edit toolbar
         sq_header_row = QHBoxLayout()
         lbl_sq = QLabel("Sub-Questions to Investigate:")
-        lbl_sq.setStyleSheet("font-size: 12px; font-weight: bold; color: #e5c07b;")
+        lbl_sq.setProperty("role", "section")
         sq_header_row.addWidget(lbl_sq)
 
         sq_header_row.addStretch()
 
-        self.btn_add_sq = QPushButton("+ Add")
-        self.btn_add_sq.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        self.btn_add_sq = QPushButton("Add")
+        self.btn_add_sq.setIcon(icon("plus"))
         self.btn_add_sq.clicked.connect(self._on_add_sq)
         sq_header_row.addWidget(self.btn_add_sq)
 
-        self.btn_del_sq = QPushButton("- Remove")
-        self.btn_del_sq.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        self.btn_del_sq = QPushButton("Remove")
+        self.btn_del_sq.setIcon(icon("trash"))
         self.btn_del_sq.clicked.connect(self._on_del_sq)
         sq_header_row.addWidget(self.btn_del_sq)
 
@@ -85,10 +100,6 @@ class ResearchPlanPanel(QFrame):
 
         # Editable Sub-Questions List
         self.list_sq = QListWidget()
-        self.list_sq.setStyleSheet(
-            "QListWidget { background-color: #1e2227; color: #dcdcdc; border: 1px solid #282c34; border-radius: 4px; }"
-            "QListWidget::item { padding: 4px; }"
-        )
         self.list_sq.itemDoubleClicked.connect(self._on_edit_sq)
         layout.addWidget(self.list_sq)
 
@@ -96,32 +107,41 @@ class ResearchPlanPanel(QFrame):
         self.skeptic_box = QTextEdit()
         self.skeptic_box.setReadOnly(True)
         self.skeptic_box.setMaximumHeight(70)
-        self.skeptic_box.setStyleSheet(
-            "background-color: #1b1d23; color: #9da5b4; border: 1px solid #282c34; font-size: 11px;"
-        )
+        self.skeptic_box.setProperty("role", "muted")
         layout.addWidget(self.skeptic_box)
 
         # Action Buttons row
         btn_row = QHBoxLayout()
         self.btn_cancel = QPushButton("Cancel")
-        self.btn_cancel.setStyleSheet("padding: 6px 14px;")
         self.btn_cancel.clicked.connect(self._on_cancel)
         btn_row.addWidget(self.btn_cancel)
 
         btn_row.addStretch()
 
         self.btn_approve = QPushButton("Approve & Start Research")
-        self.btn_approve.setStyleSheet(
-            "QPushButton { background-color: #98c379; color: #1e1e1e; font-weight: bold; padding: 6px 16px; border-radius: 4px; }"
-            "QPushButton:hover { background-color: #87b368; }"
-        )
+        set_variant(self.btn_approve, "primary")
         self.btn_approve.clicked.connect(self._on_approve)
         btn_row.addWidget(self.btn_approve)
         layout.addLayout(btn_row)
 
+        self._show_empty_state()
+
+    def _show_empty_state(self) -> None:
+        self.empty_state.setVisible(True)
+        self.list_sq.setVisible(False)
+        self.skeptic_box.setVisible(False)
+        self.btn_cancel.setVisible(False)
+        self.btn_approve.setVisible(False)
+        self._current_plan = None
+
     def set_plan(self, plan: ResearchPlan) -> None:
         """Display the plan in the panel."""
         self._current_plan = plan
+        self.empty_state.setVisible(False)
+        self.list_sq.setVisible(True)
+        self.skeptic_box.setVisible(True)
+        self.btn_cancel.setVisible(True)
+        self.btn_approve.setVisible(True)
         self.lbl_main.setText(f"Core Question: {plan.main_question}")
 
         self.list_sq.clear()
@@ -134,7 +154,7 @@ class ResearchPlanPanel(QFrame):
         chk = plan.skeptic_checklist or {}
         myths = chk.get("myths", [])
         biases = chk.get("biases", [])
-        summary_lines = ["🛡️ Skeptic Checklist:"]
+        summary_lines = ["Skeptic checklist:"]
         if myths:
             summary_lines.append("• Myths to test: " + ", ".join(myths))
         if biases:
@@ -189,4 +209,5 @@ class ResearchPlanPanel(QFrame):
             self.plan_approved.emit(self._current_plan)
 
     def _on_cancel(self) -> None:
+        self._show_empty_state()
         self.plan_cancelled.emit()

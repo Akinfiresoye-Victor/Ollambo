@@ -110,6 +110,18 @@ python -m unittest discover tests
 
 ---
 
+## Recent UI Redesign Milestones
+
+The app has been rebuilt in staged phases to keep the desktop experience calm, coherent, and resilient:
+
+- Phase 8: Research library and live progress surface
+- Phase 9: Settings, setup dialogs, and inline toast feedback
+- Phase 10: Final polish, hardening, and packaging cleanup
+
+The current UI stack centers around the theme tokens, icon system, app-shell navigation, and toast notifications so the redesign stays consistent across the whole app.
+
+---
+
 ## Project Structure
 
 ```

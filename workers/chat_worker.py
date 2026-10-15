@@ -75,9 +75,9 @@ class ChatWorker(QThread):
             extra_tokens = (estimate_tokens(self._extra_system) + 4) if self._extra_system else 0
             est_tokens = estimate_messages_tokens(self._messages) + extra_tokens
 
-            # ── 0. Strip attachment metadata (must never reach Ollama) ────
+            # ── 0. Whitelist role/content only (stopped/error/attachments never reach Ollama)
             clean_messages: list[dict[str, str]] = [
-                {k: v for k, v in m.items() if k != "attachments"}
+                {"role": str(m.get("role", "user")), "content": str(m.get("content", ""))}
                 for m in self._messages
             ]
 

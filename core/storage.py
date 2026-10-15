@@ -359,14 +359,24 @@ def _read_chat_index() -> list[dict[str, Any]]:
         return _rebuild_chat_index()
 
 
-def list_chats() -> list[dict[str, str]]:
-    """Return a list of {id, title} dicts for every saved chat, newest first.
+def list_chats() -> list[dict[str, Any]]:
+    """Return a list of {id, title, updated} dicts for every saved chat, newest first.
 
     Reads from chats/index.json instead of opening every individual chat file.
+    `updated` is additive so callers that only used id/title keep working.
     """
     entries = _read_chat_index()
     sorted_entries = sorted(entries, key=lambda e: e.get("updated", 0), reverse=True)
-    return [{"id": e["id"], "title": e.get("title", "Untitled")} for e in sorted_entries]
+    return [
+        {
+            "id": e["id"],
+            "title": e.get("title", "Untitled"),
+            "updated": e.get("updated", 0),
+            "status": e.get("status", "idle"),
+            "unread": bool(e.get("unread", False)),
+        }
+        for e in sorted_entries
+    ]
 
 
 def load_chat(chat_id: str) -> dict[str, Any] | None:
@@ -392,21 +402,30 @@ def save_chat(chat: dict[str, Any]) -> None:
     chat_id = chat["id"]
     title = chat.get("title", "Untitled")
     path = _chats_dir() / f"{chat_id}.json"
+    now = time.time()
+    chat["updated"] = now
     text = json.dumps(chat, indent=2, ensure_ascii=False)
     _atomic_write(path, text)
 
     # Update index.json
-    now = time.time()
     entries = _read_chat_index()
     found = False
     for entry in entries:
         if entry.get("id") == chat_id:
             entry["title"] = title
             entry["updated"] = now
+            entry["status"] = chat.get("status", "idle")
+            entry["unread"] = bool(chat.get("unread", False))
             found = True
             break
     if not found:
-        entries.append({"id": chat_id, "title": title, "updated": now})
+        entries.append({
+            "id": chat_id,
+            "title": title,
+            "updated": now,
+            "status": chat.get("status", "idle"),
+            "unread": bool(chat.get("unread", False)),
+        })
 
     try:
         _atomic_write(_chat_index_path(), json.dumps(entries, indent=2, ensure_ascii=False))
@@ -473,4 +492,3 @@ def delete_work_session(chat_id: str) -> None:
 def list_active_sessions() -> list[str]:
     """Return chat_ids that have an active (incomplete) work session."""
     return [p.stem for p in _sessions_dir().glob("*.json")]
-

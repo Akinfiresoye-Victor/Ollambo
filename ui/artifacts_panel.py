@@ -16,7 +16,7 @@ from pathlib import Path
 from core.pathsafe import safe_relpath
 from core import workspace
 from PySide6.QtCore import QTimer, Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QFont, QGuiApplication, QIcon
+from PySide6.QtGui import QDesktopServices, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -32,6 +32,11 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from ui.icons import icon
+from ui.theme import set_variant
+from ui.theme.tokens import DARK
+from ui.text_utils import strip_emoji_prefix
+from ui.widgets.toast import show_toast
 
 
 class ArtifactsPanel(QFrame):
@@ -42,9 +47,7 @@ class ArtifactsPanel(QFrame):
         self._files: dict[str, str] = {}
         self._tree_items: dict[str, QTreeWidgetItem] = {}
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setStyleSheet(
-            "ArtifactsPanel { background-color: #1e2227; border: 1px solid #282c34; border-radius: 6px; padding: 6px; }"
-        )
+        self.setObjectName("Card")
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -55,17 +58,19 @@ class ArtifactsPanel(QFrame):
         # Project Info Bar (Workspace title and folder path)
         proj_bar = QHBoxLayout()
         self.lbl_project_info = QLabel("")
-        self.lbl_project_info.setStyleSheet("font-size: 12px; color: #98c379;")
+        self.lbl_project_info.setProperty("role", "muted")
         self.lbl_project_info.setVisible(False)
         proj_bar.addWidget(self.lbl_project_info)
         proj_bar.addStretch()
 
-        self.btn_open_folder = QPushButton("📂 Open Folder")
+        self.btn_open_folder = QPushButton("Open folder")
+        self.btn_open_folder.setIcon(icon("folder"))
         self.btn_open_folder.clicked.connect(self._open_project_folder)
         self.btn_open_folder.setVisible(False)
         proj_bar.addWidget(self.btn_open_folder)
 
-        self.btn_export_zip = QPushButton("📦 Export .zip")
+        self.btn_export_zip = QPushButton("Export .zip")
+        self.btn_export_zip.setIcon(icon("download"))
         self.btn_export_zip.clicked.connect(self._export_project_zip)
         self.btn_export_zip.setVisible(False)
         proj_bar.addWidget(self.btn_export_zip)
@@ -74,8 +79,8 @@ class ArtifactsPanel(QFrame):
 
         # Header: File selector, title & actions
         top_bar = QHBoxLayout()
-        self.lbl_title = QLabel("📁 Artifacts (0 files)")
-        self.lbl_title.setStyleSheet("font-weight: bold; font-size: 13px; color: #61afef;")
+        self.lbl_title = QLabel("Artifacts (0 files)")
+        self.lbl_title.setProperty("role", "title")
         top_bar.addWidget(self.lbl_title)
 
         top_bar.addSpacing(10)
@@ -87,15 +92,18 @@ class ArtifactsPanel(QFrame):
 
         # Action Buttons
         self.btn_copy = QPushButton("Copy Code")
+        self.btn_copy.setIcon(icon("copy"))
         self.btn_copy.clicked.connect(self._copy_current_code)
         top_bar.addWidget(self.btn_copy)
 
         self.btn_save = QPushButton("Save File")
+        self.btn_save.setIcon(icon("download"))
         self.btn_save.clicked.connect(self._save_single_file)
         top_bar.addWidget(self.btn_save)
 
-        self.btn_save_all = QPushButton("💾 Save All to Folder")
-        self.btn_save_all.setStyleSheet("font-weight: bold; background-color: #3e4451; color: white;")
+        self.btn_save_all = QPushButton("Save All to Folder")
+        self.btn_save_all.setIcon(icon("download"))
+        set_variant(self.btn_save_all, "primary")
         self.btn_save_all.clicked.connect(self._save_all_files)
         top_bar.addWidget(self.btn_save_all)
 
@@ -103,13 +111,21 @@ class ArtifactsPanel(QFrame):
 
         # Continuation / Testing Progress banner
         self.lbl_progress = QLabel("")
-        self.lbl_progress.setStyleSheet("color: #e5c07b; font-size: 11px; font-style: italic; padding: 2px;")
+        self.lbl_progress.setProperty("role", "warning")
         self.lbl_progress.setVisible(False)
         layout.addWidget(self.lbl_progress)
 
+        self.empty_state = QWidget()
+        empty_layout = QVBoxLayout(self.empty_state)
+        empty_layout.setContentsMargins(0, 12, 0, 0)
+        self.empty_label = QLabel("No files yet. Generate or add a project to see artifacts here.")
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setProperty("role", "muted")
+        empty_layout.addWidget(self.empty_label)
+        layout.addWidget(self.empty_state)
+
         # Splitter: Tree navigation on left, Code viewer on right
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setStyleSheet("QSplitter::handle { background-color: #282c34; width: 4px; }")
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # Left: Folder Structure Tree
         tree_container = QWidget()
@@ -118,47 +134,42 @@ class ArtifactsPanel(QFrame):
         tree_layout.setSpacing(4)
 
         tree_title = QLabel("Project Structure")
-        tree_title.setStyleSheet("font-size: 11px; font-weight: bold; color: #abb2bf; padding: 2px;")
+        tree_title.setProperty("role", "section")
         tree_layout.addWidget(tree_title)
 
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
         self.tree.setColumnCount(1)
-        self.tree.setStyleSheet(
-            "QTreeWidget { background-color: #181a1f; color: #abb2bf; border: 1px solid #282c34; "
-            "border-radius: 4px; font-size: 12px; } "
-            "QTreeWidget::item:selected { background-color: #2c313a; color: #61afef; }"
-        )
         self.tree.itemClicked.connect(self._on_tree_item_clicked)
         tree_layout.addWidget(self.tree)
-        splitter.addWidget(tree_container)
+        self.splitter.addWidget(tree_container)
 
         # Right: Code viewer
         self.code_viewer = QPlainTextEdit()
         self.code_viewer.setReadOnly(True)
-        self.code_viewer.setFont(QFont("Consolas", 10))
-        self.code_viewer.setStyleSheet(
-            "QPlainTextEdit { background-color: #14161a; color: #abb2bf; border: 1px solid #21252b; "
-            "border-radius: 4px; font-family: Consolas, monospace; line-height: 1.4; }"
-        )
-        splitter.addWidget(self.code_viewer)
+        self.code_viewer.setProperty("role", "code")
+        self.splitter.addWidget(self.code_viewer)
 
-        splitter.setSizes([200, 600])
-        layout.addWidget(splitter)
+        self.splitter.setSizes([200, 600])
+        self.splitter.setVisible(False)
+        layout.addWidget(self.splitter)
 
     def show_continuation_progress(self, filename: str, part: int, max_parts: int) -> None:
         """Show progress indicator when generating multi-part continuations."""
-        self.lbl_progress.setText(f"⏳ Generating Part {part} of `{filename}` (limit {max_parts})…")
+        self.lbl_progress.setText(f"Generating part {part} of `{filename}` (limit {max_parts})…")
         self.lbl_progress.setVisible(True)
 
     def show_test_status(self, filename: str, status_msg: str) -> None:
         """Show progress indicator when running automated testing or code repairs."""
-        self.lbl_progress.setText(status_msg)
+        clean_status, _ = strip_emoji_prefix(status_msg)
+        self.lbl_progress.setText(clean_status)
         self.lbl_progress.setVisible(True)
 
     def add_file(self, filename: str, content: str) -> None:
         """Add or update an artifact file in the panel and tree view."""
         self.lbl_progress.setVisible(False)
+        self.empty_state.setVisible(False)
+        self.splitter.setVisible(True)
         self._files[filename] = content
 
         # Update Tree
@@ -174,8 +185,7 @@ class ArtifactsPanel(QFrame):
             self.code_viewer.setPlainText(content)
 
         count = len(self._files)
-        self.lbl_title.setText(f"📁 Artifacts ({count} {'file' if count == 1 else 'files'})")
-        self.setVisible(True)
+        self.lbl_title.setText(f"Artifacts ({count} {'file' if count == 1 else 'files'})")
 
     def _add_or_update_tree(self, filename: str) -> None:
         """Parse relative path and build/update tree nodes."""
@@ -190,7 +200,8 @@ class ArtifactsPanel(QFrame):
             if dir_path in self._tree_items:
                 parent_item = self._tree_items[dir_path]
             else:
-                new_item = QTreeWidgetItem([f"📁 {dir_name}/"])
+                new_item = QTreeWidgetItem([f"{dir_name}/"])
+                new_item.setIcon(0, icon("folder", DARK.colors.text_secondary, 16))
                 new_item.setData(0, Qt.ItemDataRole.UserRole, "")  # Empty file data
                 if parent_item is None:
                     self.tree.addTopLevelItem(new_item)
@@ -204,9 +215,25 @@ class ArtifactsPanel(QFrame):
         file_name = parts[-1]
         if filename in self._tree_items:
             leaf_item = self._tree_items[filename]
-            leaf_item.setText(0, f"📄 {file_name}")
+            leaf_item.setText(0, file_name)
+            leaf_item.setIcon(
+                0,
+                icon(
+                    "file-code" if Path(file_name).suffix.lower() in (".py", ".js", ".ts", ".css", ".html", ".json") else "file",
+                    DARK.colors.text_secondary,
+                    16,
+                ),
+            )
         else:
-            leaf_item = QTreeWidgetItem([f"📄 {file_name}"])
+            leaf_item = QTreeWidgetItem([file_name])
+            leaf_item.setIcon(
+                0,
+                icon(
+                    "file-code" if Path(file_name).suffix.lower() in (".py", ".js", ".ts", ".css", ".html", ".json") else "file",
+                    DARK.colors.text_secondary,
+                    16,
+                ),
+            )
             leaf_item.setData(0, Qt.ItemDataRole.UserRole, filename)
             if parent_item is None:
                 self.tree.addTopLevelItem(leaf_item)
@@ -238,6 +265,7 @@ class ArtifactsPanel(QFrame):
             if clipboard:
                 clipboard.setText(code)
                 self.btn_copy.setText("Copied!")
+                show_toast(self, "Code copied to clipboard", duration=1800)
                 QTimer.singleShot(1500, lambda: self.btn_copy.setText("Copy Code"))
 
     def _save_single_file(self) -> None:
@@ -253,7 +281,7 @@ class ArtifactsPanel(QFrame):
                 p = Path(path)
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_text(content, encoding="utf-8")
-                QMessageBox.information(self, "Saved", f"Saved to {path}")
+                show_toast(self, f"Saved to {p.name}")
             except Exception as e:
                 QMessageBox.critical(self, "Save Failed", f"Could not save file: {e}")
 
@@ -283,11 +311,9 @@ class ArtifactsPanel(QFrame):
             msg = f"Successfully exported {saved_count} files with directory structure to:\n{folder}"
             if unsafe_count:
                 msg += f"\n\n(Skipped {unsafe_count} unsafe file names)"
-            QMessageBox.information(
-                self,
-                "Saved All",
-                msg,
-            )
+            show_toast(self, f"Saved {saved_count} files")
+            if unsafe_count:
+                QMessageBox.warning(self, "Partial export", msg)
 
     def _open_project_folder(self) -> None:
         if not getattr(self, "_current_workspace_id", None):
@@ -304,7 +330,7 @@ class ArtifactsPanel(QFrame):
         dest, _ = QFileDialog.getSaveFileName(self, "Export Workspace as ZIP", f"{slug}.zip", "Zip Files (*.zip)")
         if dest:
             if workspace.export_zip(self._current_workspace_id, dest):
-                QMessageBox.information(self, "Exported", f"Successfully exported project to:\n{dest}")
+                show_toast(self, "Workspace exported")
             else:
                 QMessageBox.critical(self, "Export Failed", "Failed to export zip file.")
 
@@ -318,20 +344,26 @@ class ArtifactsPanel(QFrame):
         p = workspace.workspace_path(workspace_id)
         folder_str = str(p) if p else ws.get("slug", "")
         self.lbl_project_info.setText(
-            f"🏷️ <b>{ws.get('name', 'Project')}</b> &nbsp;<span style='color: #7f848e;'>({folder_str})</span>"
+            f"<b>{ws.get('name', 'Project')}</b> &nbsp;"
+            f"<span style='color: {DARK.colors.text_tertiary};'>({folder_str})</span>"
         )
         self.lbl_project_info.setVisible(True)
         self.btn_open_folder.setVisible(bool(p and p.exists()))
         self.btn_export_zip.setVisible(True)
 
         files = workspace.list_files(workspace_id)
+        if not files:
+            self.empty_state.setVisible(True)
+            self.splitter.setVisible(False)
+            return
+
         for f in files:
             content = workspace.read_file(workspace_id, f)
             if content is not None:
                 self.add_file(f, content)
 
-        if files:
-            self.setVisible(True)
+        self.empty_state.setVisible(False)
+        self.splitter.setVisible(True)
 
     def clear(self) -> None:
         self._current_workspace_id = None
@@ -340,7 +372,7 @@ class ArtifactsPanel(QFrame):
         self.tree.clear()
         self.file_combo.clear()
         self.code_viewer.clear()
-        self.lbl_title.setText("📁 Artifacts (0 files)")
+        self.lbl_title.setText("Artifacts (0 files)")
         if hasattr(self, "lbl_project_info"):
             self.lbl_project_info.clear()
             self.lbl_project_info.setVisible(False)
@@ -348,4 +380,5 @@ class ArtifactsPanel(QFrame):
             self.btn_open_folder.setVisible(False)
         if hasattr(self, "btn_export_zip"):
             self.btn_export_zip.setVisible(False)
-        self.setVisible(False)
+        self.empty_state.setVisible(True)
+        self.splitter.setVisible(False)

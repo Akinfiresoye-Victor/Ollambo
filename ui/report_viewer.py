@@ -32,6 +32,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from ui.icons import icon
+from ui.theme.tokens import DARK
 
 # Optional WebEngine import
 _HAS_WEBENGINE = False
@@ -87,39 +89,39 @@ def markdown_to_report_html(markdown_text: str, mermaid_js_url: str = "") -> str
     if not mermaid_js_url:
         mermaid_js_url = _get_mermaid_js_url()
 
-    # Dark-themed stylesheet matching Ollambo's UI
+    # The report's HTML renderer uses the same color and font tokens as Qt.
     css = """
     body {
-        background-color: #1e2227;
-        color: #abb2bf;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        background-color: @window@;
+        color: @secondary@;
+        font-family: @ui_font@;
         line-height: 1.6;
         padding: 30px;
         max-width: 900px;
         margin: 0 auto;
     }
     h1, h2, h3, h4, h5, h6 {
-        color: #e5c07b;
+        color: @primary@;
         margin-top: 1.4em;
         margin-bottom: 0.6em;
-        border-bottom: 1px solid #282c34;
+        border-bottom: 1px solid @border_subtle@;
         padding-bottom: 0.3em;
     }
-    h1 { color: #61afef; font-size: 2em; border-bottom: 2px solid #333842; }
-    h2 { font-size: 1.4em; color: #98c379; }
-    a { color: #61afef; text-decoration: none; }
+    h1 { color: @accent@; font-size: 2em; border-bottom: 2px solid @border@; }
+    h2 { font-size: 1.4em; color: @primary@; }
+    a { color: @accent@; text-decoration: none; }
     a:hover { text-decoration: underline; }
     code {
-        background-color: #282c34;
-        color: #e06c75;
+        background-color: @raised@;
+        color: @code_text@;
         padding: 2px 6px;
         border-radius: 4px;
-        font-family: Consolas, "Courier New", monospace;
+        font-family: @mono_font@;
         font-size: 0.9em;
     }
     pre {
-        background-color: #21252b;
-        border: 1px solid #2c313a;
+        background-color: @code_background@;
+        border: 1px solid @border_subtle@;
         border-radius: 6px;
         padding: 12px;
         overflow-x: auto;
@@ -131,33 +133,33 @@ def markdown_to_report_html(markdown_text: str, mermaid_js_url: str = "") -> str
         font-size: 0.9em;
     }
     th, td {
-        border: 1px solid #3e4451;
+        border: 1px solid @border@;
         padding: 10px 12px;
         text-align: left;
     }
     th {
-        background-color: #282c34;
-        color: #e5c07b;
+        background-color: @raised@;
+        color: @primary@;
         font-weight: 600;
     }
-    tr:nth-child(even) { background-color: #21252b; }
+    tr:nth-child(even) { background-color: @surface@; }
     blockquote {
         margin: 15px 0;
         padding: 10px 20px;
-        background-color: #21252b;
-        border-left: 4px solid #61afef;
-        color: #9da5b4;
+        background-color: @surface@;
+        border-left: 4px solid @accent@;
+        color: @secondary@;
     }
     .mermaid {
-        background-color: #21252b;
+        background-color: @surface@;
         text-align: center;
         padding: 15px;
         border-radius: 6px;
         margin: 20px 0;
     }
     details {
-        background-color: #21252b;
-        border: 1px solid #2c313a;
+        background-color: @surface@;
+        border: 1px solid @border_subtle@;
         border-radius: 6px;
         padding: 10px 15px;
         margin: 15px 0;
@@ -165,9 +167,25 @@ def markdown_to_report_html(markdown_text: str, mermaid_js_url: str = "") -> str
     summary {
         cursor: pointer;
         font-weight: bold;
-        color: #61afef;
+        color: @accent@;
     }
     """
+    replacements = {
+        "@window@": DARK.colors.window,
+        "@secondary@": DARK.colors.text_secondary,
+        "@primary@": DARK.colors.text_primary,
+        "@accent@": DARK.colors.accent,
+        "@border_subtle@": DARK.colors.border_subtle,
+        "@border@": DARK.colors.border,
+        "@raised@": DARK.colors.raised,
+        "@code_text@": DARK.colors.code_text,
+        "@code_background@": DARK.colors.code_background,
+        "@surface@": DARK.colors.surface,
+        "@ui_font@": ", ".join(f'"{family}"' for family in DARK.fonts.ui),
+        "@mono_font@": ", ".join(f'"{family}"' for family in DARK.fonts.mono),
+    }
+    for placeholder, value in replacements.items():
+        css = css.replace(placeholder, value)
 
     full_page = f"""<!DOCTYPE html>
 <html>
@@ -220,36 +238,42 @@ class ReportViewerDialog(QDialog):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        self.setStyleSheet("background-color: #1e2227; color: #abb2bf;")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
         # Top toolbar
         toolbar = QHBoxLayout()
-        lbl_info = QLabel("📚 Research Report")
-        lbl_info.setStyleSheet("font-size: 15px; font-weight: bold; color: #61afef;")
+        lbl_info = QLabel("Research report")
+        lbl_info.setProperty("role", "title")
+        lbl_info_icon = QLabel()
+        lbl_info_icon.setPixmap(icon("file", size=18).pixmap(18, 18))
+        toolbar.addWidget(lbl_info_icon)
         toolbar.addWidget(lbl_info)
 
         toolbar.addStretch()
 
-        btn_copy = QPushButton("📋 Copy Markdown")
-        btn_copy.setStyleSheet("padding: 5px 12px; background-color: #282c34; border-radius: 4px;")
+        btn_copy = QPushButton("Copy Markdown")
+        btn_copy.setIcon(icon("copy"))
+        btn_copy.setProperty("variant", "ghost")
         btn_copy.clicked.connect(self._copy_markdown)
         toolbar.addWidget(btn_copy)
 
-        btn_export_md = QPushButton("💾 Export .md")
-        btn_export_md.setStyleSheet("padding: 5px 12px; background-color: #282c34; border-radius: 4px;")
+        btn_export_md = QPushButton("Export .md")
+        btn_export_md.setIcon(icon("download"))
+        btn_export_md.setProperty("variant", "ghost")
         btn_export_md.clicked.connect(self._export_md)
         toolbar.addWidget(btn_export_md)
 
-        btn_export_html = QPushButton("🌐 Export HTML")
-        btn_export_html.setStyleSheet("padding: 5px 12px; background-color: #282c34; border-radius: 4px;")
+        btn_export_html = QPushButton("Export HTML")
+        btn_export_html.setIcon(icon("external-link"))
+        btn_export_html.setProperty("variant", "ghost")
         btn_export_html.clicked.connect(self._export_html)
         toolbar.addWidget(btn_export_html)
 
-        btn_close = QPushButton("✕ Close")
-        btn_close.setStyleSheet("padding: 5px 12px; background-color: #4b5263; color: #ffffff; border-radius: 4px;")
+        btn_close = QPushButton("Close")
+        btn_close.setIcon(icon("x"))
+        btn_close.setProperty("variant", "ghost")
         btn_close.clicked.connect(self.close)
         toolbar.addWidget(btn_close)
 
@@ -258,17 +282,14 @@ class ReportViewerDialog(QDialog):
         # Secondary toolbar: find in report and zoom
         sub_bar = QHBoxLayout()
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("🔍 Find in report… (Press Enter)")
+        self.search_input.setPlaceholderText("Find in report… (Press Enter)")
+        self.search_input.addAction(icon("search"), QLineEdit.ActionPosition.LeadingPosition)
         self.search_input.setMaximumWidth(220)
-        self.search_input.setStyleSheet(
-            "QLineEdit { background-color: #21252b; color: #abb2bf; border: 1px solid #333842; "
-            "border-radius: 4px; padding: 4px 8px; }"
-        )
         self.search_input.returnPressed.connect(self._find_next)
         sub_bar.addWidget(self.search_input)
 
         btn_find = QPushButton("Find Next")
-        btn_find.setStyleSheet("padding: 4px 8px; font-size: 11px;")
+        btn_find.setProperty("variant", "ghost")
         btn_find.clicked.connect(self._find_next)
         sub_bar.addWidget(btn_find)
 
@@ -276,13 +297,13 @@ class ReportViewerDialog(QDialog):
 
         btn_zoom_out = QPushButton("A-")
         btn_zoom_out.setToolTip("Zoom Out")
-        btn_zoom_out.setStyleSheet("padding: 2px 8px; font-weight: bold;")
+        btn_zoom_out.setProperty("variant", "ghost")
         btn_zoom_out.clicked.connect(self._zoom_out)
         sub_bar.addWidget(btn_zoom_out)
 
         btn_zoom_in = QPushButton("A+")
         btn_zoom_in.setToolTip("Zoom In")
-        btn_zoom_in.setStyleSheet("padding: 2px 8px; font-weight: bold;")
+        btn_zoom_in.setProperty("variant", "ghost")
         btn_zoom_in.clicked.connect(self._zoom_in)
         sub_bar.addWidget(btn_zoom_in)
 
@@ -312,12 +333,21 @@ class ReportViewerDialog(QDialog):
                 self._web_view = None
 
         # Fallback view
-        fallback_notice = QLabel("ℹ️ WebEngine view unavailable. Showing read-only formatted text with copyable Mermaid blocks.")
-        fallback_notice.setStyleSheet("color: #e5c07b; font-size: 12px; padding: 4px;")
+        fallback_notice = QWidget()
+        fallback_layout = QHBoxLayout(fallback_notice)
+        fallback_layout.setContentsMargins(0, 0, 0, 0)
+        fallback_icon = QLabel()
+        fallback_icon.setPixmap(icon("alert-triangle", size=16).pixmap(16, 16))
+        fallback_text = QLabel(
+            "WebEngine view unavailable. Showing read-only formatted text with copyable Mermaid blocks."
+        )
+        fallback_text.setProperty("role", "warning")
+        fallback_layout.addWidget(fallback_icon)
+        fallback_layout.addWidget(fallback_text)
         layout.addWidget(fallback_notice)
 
         tb = QTextBrowser(self)
-        tb.setStyleSheet("background-color: #21252b; color: #dcdcdc; border: 1px solid #333842; font-size: 13px;")
+        tb.setProperty("role", "report")
         tb.setOpenExternalLinks(True)
         tb.setMarkdown(self._markdown)
         layout.addWidget(tb)
