@@ -301,6 +301,24 @@ def list_workspaces(kind: str | None = None) -> list[dict[str, Any]]:
     return entries
 
 
+def list_workspaces_for_chat(chat_id: str) -> list[dict[str, Any]]:
+    """List code workspaces linked to a chat or recorded in its workspace history."""
+    if not chat_id:
+        return []
+    from core.storage import load_chat
+
+    chat = load_chat(chat_id) or {}
+    workspace_ids = set(chat.get("workspace_ids_history") or [])
+    if workspace_id := chat.get("workspace_id"):
+        workspace_ids.add(workspace_id)
+    return [
+        ws
+        for ws in list_workspaces(kind="code")
+        if chat_id in (ws.get("chat_ids") or []) or ws.get("id") in workspace_ids
+        or ws.get("slug") in workspace_ids
+    ]
+
+
 def workspace_path(workspace_id_or_slug: str) -> Path | None:
     """Return the Path to the project root directory, or None if not found."""
     ws = get_workspace(workspace_id_or_slug)

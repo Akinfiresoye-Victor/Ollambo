@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 
 from core.installer import InstallPlan, get_install_plan
 from core.setup_checker import SUGGESTED_MODELS, check_hardware_capabilities
-from ui.icons import icon
+from ui.icons import StatusIcon, icon
 from ui.text_utils import strip_emoji_prefix
 from ui.terminal_widget import TerminalWidget
 from ui.theme.tokens import DARK
@@ -79,7 +79,7 @@ class SetupWizard(QWidget):
         layout.addLayout(hdr)
 
         # ── Check status lines ────────────────────────────────────────
-        self._check_icons: dict[str, QLabel] = {}
+        self._check_icons: dict[str, StatusIcon] = {}
         self._check_labels = {
             "installed": QLabel("Ollama installed — checking…"),
             "server": QLabel("Ollama server — waiting…"),
@@ -88,8 +88,7 @@ class SetupWizard(QWidget):
         self._check_states: dict[str, str] = {}
         for name, lbl in self._check_labels.items():
             row = QHBoxLayout()
-            icon_label = QLabel()
-            icon_label.setFixedSize(18, 18)
+            icon_label = StatusIcon(16, parent=self)
             row.addWidget(icon_label)
             lbl.setProperty("role", "body")
             row.addWidget(lbl)
@@ -221,9 +220,15 @@ class SetupWizard(QWidget):
         self._check_states[name] = state
         clean_text, _ = strip_emoji_prefix(text)
         label.setText(clean_text)
-        icon_name = {"checking": "loader", "ok": "check", "failed": "alert-triangle"}[state]
-        color = DARK.colors.accent if state == "ok" else DARK.colors.text_secondary
-        icon_label.setPixmap(icon(icon_name, color, 16).pixmap(16, 16))
+        if state == "checking":
+            icon_label.set_color(DARK.colors.accent)
+            icon_label.set_state("loading")
+        elif state == "ok":
+            icon_label.set_color(DARK.colors.accent)
+            icon_label.set_state("ok")
+        else:
+            icon_label.set_color(DARK.colors.text_secondary)
+            icon_label.set_state("failed")
 
     @Slot(bool, list, bool)
     def _on_all_done(self, all_ok: bool, models: list[str], server_started: bool) -> None:

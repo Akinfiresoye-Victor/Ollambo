@@ -39,8 +39,9 @@ from core.research_store import (
     open_project_folder,
     rename_project,
 )
-from ui.icons import icon
+from ui.icons import StatusIcon, icon
 from ui.theme import set_property, set_variant
+from ui.theme.tokens import DARK
 from ui.text_utils import strip_emoji_prefix
 from ui.report_viewer import ReportViewerDialog
 from ui.widgets.toast import show_toast
@@ -171,7 +172,7 @@ class ResearchPanel(QWidget):
 
         step_layout.addSpacing(8)
 
-        self.stage_status_icon = QLabel()
+        self.stage_status_icon = StatusIcon(16, parent=self.progress_frame)
         step_layout.addWidget(self.stage_status_icon)
         self.stage_status_lbl = QLabel("Ready")
         self.stage_status_lbl.setProperty("role", "accent")
@@ -385,13 +386,15 @@ class ResearchPanel(QWidget):
             "warn": "alert-triangle",
         }
         if category:
-            self.stage_status_icon.setPixmap(
-                icon(category_icons[category], size=16).pixmap(16, 16)
+            self.stage_status_icon.set_color(DARK.colors.text_secondary)
+            self.stage_status_icon.set_state(
+                {"search": "message", "fetch": "external-link", "read": "file", "check": "check", "warn": "failed"}.get(category, "idle")
             )
         elif step_name.lower() in ("idle", "ready", "completed"):
-            self.stage_status_icon.clear()
+            self.stage_status_icon.set_state("idle")
         else:
-            self.stage_status_icon.setPixmap(icon("loader", size=16).pixmap(16, 16))
+            self.stage_status_icon.set_color(DARK.colors.accent)
+            self.stage_status_icon.set_state("loading")
 
         if clean_message:
             self.stage_status_lbl.setText(f"{step_name}: {clean_message[:40]}")

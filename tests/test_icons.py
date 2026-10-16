@@ -26,16 +26,20 @@ class IconTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             icon("plus", size=0)
 
-    def test_spinner_pauses_when_hidden_and_in_low_power_mode(self) -> None:
+    def test_spinner_keeps_rotating_in_low_power_mode_and_stops_when_hidden(self) -> None:
         spinner = Spinner(low_power_mode=True)
         spinner.show()
         self.app.processEvents()
+        self.assertTrue(spinner.timer.isActive())
+        self.assertGreaterEqual(spinner.timer.interval(), 400)
+
+        spinner.hide()
         self.assertFalse(spinner.timer.isActive())
 
         spinner.set_low_power_mode(False)
+        spinner.show()
         self.assertTrue(spinner.timer.isActive())
-        spinner.hide()
-        self.assertFalse(spinner.timer.isActive())
+        self.assertLess(spinner.timer.interval(), 400)
 
     def test_strips_leading_emoji_and_guesses_action(self) -> None:
         self.assertEqual(

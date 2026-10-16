@@ -42,18 +42,29 @@ class ChatView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        self._center_host = QWidget(self)
+        self._center_layout = QHBoxLayout(self._center_host)
+        self._center_layout.setContentsMargins(0, 0, 0, 0)
+        self._center_layout.addStretch()
+
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.scroll_area.setMinimumWidth(0)
+        self.scroll_area.setProperty("role", "body")
         if sb := self.scroll_area.verticalScrollBar():
             sb.valueChanged.connect(self._on_scroll_value_changed)
 
         self.history_container = QWidget()
+        self.history_container.setMaximumWidth(760)
         self.history_layout = QVBoxLayout(self.history_container)
         self.history_layout.setContentsMargins(0, 0, 0, 0)
         self.history_layout.addStretch()
         self.scroll_area.setWidget(self.history_container)
-        layout.addWidget(self.scroll_area)
+
+        self._center_layout.addWidget(self.scroll_area, 1)
+        self._center_layout.addStretch()
+        layout.addWidget(self._center_host)
 
         self._stream_flush_timer = QTimer(self)
         self._stream_flush_timer.setInterval(100)

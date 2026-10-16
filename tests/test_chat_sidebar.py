@@ -24,11 +24,8 @@ class ChatSidebarTests(unittest.TestCase):
             {"id": "chat-2", "title": "Beta notes", "updated": now, "status": "idle"},
         ]
         self.chat_list = patch("ui.chat_sidebar.list_chats", return_value=self.chats)
-        self.active_sessions = patch("ui.chat_sidebar.list_active_sessions", return_value=[])
         self.chat_list.start()
-        self.active_sessions.start()
         self.addCleanup(self.chat_list.stop)
-        self.addCleanup(self.active_sessions.stop)
         self.sidebar = ChatSidebar()
         self.sidebar.show()
         self.app.processEvents()
@@ -54,10 +51,12 @@ class ChatSidebarTests(unittest.TestCase):
 
         item = self._item_for("chat-1")
         first_row = self.sidebar.list_widget.itemWidget(item)
+        other_row = self.sidebar.list_widget.itemWidget(self._item_for("chat-2"))
         self.sidebar.set_chat_state("chat-1", status="generating")
         row = self.sidebar.list_widget.itemWidget(item)
         self.assertIsInstance(row, _ChatRow)
         self.assertIsNot(row, first_row)
+        self.assertIs(self.sidebar.list_widget.itemWidget(self._item_for("chat-2")), other_row)
 
         QTest.mouseClick(row, Qt.MouseButton.LeftButton)
         self.assertEqual(selected, ["chat-1"])
@@ -80,17 +79,84 @@ class ChatSidebarTests(unittest.TestCase):
         self.assertEqual(row.title_label.text(), "Renamed project")
 
     def test_upsert_changes_title_without_clearing_saved_row_state(self) -> None:
-        self.chats[0]["status"] = "generating"
-        self.chats[0]["unread"] = True
+        self.sidebar.set_chat_state("chat-1", status="generating", unread=True)
+        item = self._item_for("chat-1")
+        row_before = self.sidebar.list_widget.itemWidget(item)
+        order_before = [
+            self.sidebar.list_widget.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.sidebar.list_widget.count())
+            if self.sidebar.list_widget.item(i).data(Qt.ItemDataRole.UserRole) is not None
+        ]
 
         self.sidebar.upsert_chat("chat-1", "Updated title")
 
-        item = self._item_for("chat-1")
         row = self.sidebar.list_widget.itemWidget(item)
         self.assertEqual(item.data(Qt.ItemDataRole.UserRole + 3), "Updated title")
         self.assertEqual(item.data(Qt.ItemDataRole.UserRole + 1), "generating")
         self.assertTrue(item.data(Qt.ItemDataRole.UserRole + 2))
+        self.assertIs(row, row_before)
         self.assertIsNotNone(row.spinner)
+        order_after = [
+            self.sidebar.list_widget.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.sidebar.list_widget.count())
+            if self.sidebar.list_widget.item(i).data(Qt.ItemDataRole.UserRole) is not None
+        ]
+        self.assertEqual(order_after, order_before)
+
+    def test_active_chat_is_the_only_highlight_and_refresh_restores_it(self) -> None:
+        self.sidebar.set_active_chat("chat-2")
+        self.assertEqual(
+            self.sidebar.list_widget.currentItem().data(Qt.ItemDataRole.UserRole),
+            "chat-2",
+        )
+
+        self.sidebar.refresh_list()
+
+        self.assertEqual(
+            self.sidebar.list_widget.currentItem().data(Qt.ItemDataRole.UserRole),
+            "chat-2",
+        )
+        self.sidebar.clear_selection()
+        self.assertIsNone(self.sidebar.list_widget.currentItem())
+        self.sidebar.refresh_list()
+        self.assertIsNone(self.sidebar.list_widget.currentItem())
+
+    def test_saved_busy_status_does_not_show_a_permanent_spinner(self) -> None:
+        self.chats[0]["status"] = "generating"
+        self.sidebar.refresh_list()
+        row = self.sidebar.list_widget.itemWidget(self._item_for("chat-1"))
+        self.assertIsInstance(row, _ChatRow)
+        self.assertIsNone(row.spinner)
+
+        self.sidebar.set_chat_state("chat-1", status="generating")
+        self.sidebar.refresh_list()
+        row = self.sidebar.list_widget.itemWidget(self._item_for("chat-1"))
+        self.assertIsNotNone(row.spinner)
+
+    def test_new_message_moves_only_that_row_to_the_top(self) -> None:
+        item = self._item_for("chat-2")
+        row = self.sidebar.list_widget.itemWidget(item)
+
+        self.sidebar.upsert_chat("chat-2", "Beta notes", new_message=True)
+
+        self.assertEqual(self.sidebar.list_widget.item(1).data(Qt.ItemDataRole.UserRole), "chat-2")
+        self.assertIs(self.sidebar.list_widget.itemWidget(item), row)
+
+    def test_first_message_in_new_chat_inserts_only_its_row_at_the_top(self) -> None:
+        row_one = self.sidebar.list_widget.itemWidget(self._item_for("chat-1"))
+        row_two = self.sidebar.list_widget.itemWidget(self._item_for("chat-2"))
+        self.chats.append({
+            "id": "chat-3",
+            "title": "Gamma build",
+            "updated": datetime.datetime.now().timestamp(),
+            "status": "idle",
+        })
+
+        self.sidebar.upsert_chat("chat-3", "Gamma build", new_message=True)
+
+        self.assertEqual(self.sidebar.list_widget.item(1).data(Qt.ItemDataRole.UserRole), "chat-3")
+        self.assertIs(self.sidebar.list_widget.itemWidget(self._item_for("chat-1")), row_one)
+        self.assertIs(self.sidebar.list_widget.itemWidget(self._item_for("chat-2")), row_two)
 
 
 if __name__ == "__main__":

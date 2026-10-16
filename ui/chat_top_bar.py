@@ -6,7 +6,8 @@ and live operation progress bar.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -14,11 +15,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QProgressBar,
     QPushButton,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from ui.icons import Spinner, icon
+from ui.icons import Spinner, StatusIcon, icon
 from ui.theme import set_property
 from ui.theme.tokens import DARK
 from ui.text_utils import strip_emoji_prefix
@@ -40,9 +42,12 @@ class ChatTopBar(QWidget):
     model_changed = Signal(str)
     refresh_clicked = Signal()
     coding_mode_toggled = Signal(bool)
+    artifacts_requested = Signal()
     mode_changed = Signal(str)
     keep_warm_requested = Signal(str)
     connection_expired = Signal(str)
+    sidebar_toggle_requested = Signal()
+    inspector_toggle_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -56,23 +61,56 @@ class ChatTopBar(QWidget):
 
         # ── Controls row ──────────────────────────────────────────────
         ctrl_row = QHBoxLayout()
-        ctrl_row.setContentsMargins(0, 0, 0, 0)
+        ctrl_row.setContentsMargins(0, 4, 0, 0)
         ctrl_row.setSpacing(8)
+        self.setMinimumHeight(44)
+
+        self.btn_sidebar_toggle = QToolButton()
+        self.btn_sidebar_toggle.setIcon(icon("sidebar-left", DARK.colors.text_secondary, 16))
+        self.btn_sidebar_toggle.setToolTip("Toggle sidebar (Ctrl+B)")
+        self.btn_sidebar_toggle.setProperty("variant", "ghost")
+        self.btn_sidebar_toggle.setProperty("iconOnly", "true")
+        self.btn_sidebar_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sidebar_toggle.clicked.connect(self.sidebar_toggle_requested.emit)
+        ctrl_row.addWidget(self.btn_sidebar_toggle)
 
         # Auto-updating combo box (triggers refresh on open)
         self.model_combo = AutoUpdateComboBox()
+        self.model_combo.setProperty("role", "chip")
         self.model_combo.setMinimumWidth(200)
         self.model_combo.currentTextChanged.connect(self._on_model_text_changed)
         self.model_combo.popup_opened.connect(self.refresh_clicked.emit)
         ctrl_row.addWidget(self.model_combo)
 
-        self.btn_refresh = QPushButton("Refresh")
-        self.btn_refresh.setToolTip("Manually refresh installed Ollama models")
+        self.btn_artifacts = QPushButton("Artifacts")
+        self.btn_artifacts.setIcon(icon("folder"))
+        self.btn_artifacts.setToolTip("Open this chat's projects")
+        self.btn_artifacts.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_artifacts.clicked.connect(self.artifacts_requested.emit)
+        ctrl_row.addWidget(self.btn_artifacts)
+        self.artifact_count_badge = QLabel("0")
+        self.artifact_count_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.artifact_count_badge.setMinimumWidth(22)
+        self.artifact_count_badge.setProperty("role", "caption")
+        self.artifact_count_badge.setStyleSheet(
+            f"QLabel {{ background-color: {DARK.colors.raised}; "
+            f"border: 1px solid {DARK.colors.border_subtle}; border-radius: 10px; "
+            "padding: 1px 5px; }"
+        )
+        ctrl_row.addWidget(self.artifact_count_badge)
+
+        self.btn_refresh = QToolButton()
+        self.btn_refresh.setIcon(icon("refresh", DARK.colors.text_secondary, 16))
+        self.btn_refresh.setToolTip("Refresh models")
+        self.btn_refresh.setProperty("variant", "ghost")
+        self.btn_refresh.setProperty("iconOnly", "true")
+        self.btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_refresh.clicked.connect(self.refresh_clicked.emit)
         ctrl_row.addWidget(self.btn_refresh)
 
         self.mode_combo = QComboBox()
-        self.mode_combo.addItem(icon("message"), "Auto detect", "auto")
+        self.mode_combo.setProperty("role", "chip")
+        self.mode_combo.addItem(icon("bolt"), "Auto detect", "auto")
         self.mode_combo.addItem(icon("file-code"), "Code mode", "code")
         self.mode_combo.addItem(icon("message"), "Chat only", "chat")
         self.mode_combo.addItem(icon("globe"), "Research", "research")
@@ -113,11 +151,24 @@ class ChatTopBar(QWidget):
         ctrl_row.addWidget(self._web_badge_container)
 
         # ── Keep-Alive Connection Badge ────────────────────────────────
-        self.lbl_connection_icon = QLabel()
+        self.lbl_connection_icon = StatusIcon(16, DARK.colors.text_tertiary, parent=self)
         ctrl_row.addWidget(self.lbl_connection_icon)
-        self.lbl_connection = QLabel("Standby (loads on prompt)")
+        self.lbl_connection = QLabel("Standby")
         self.lbl_connection.setObjectName("ConnectionBadge")
         self.lbl_connection.setProperty("state", "standby")
+        connection_metrics = QFontMetrics(self.lbl_connection.font())
+        self.lbl_connection.setFixedWidth(
+            max(
+                connection_metrics.horizontalAdvance(text)
+                for text in (
+                    "Standby",
+                    "Ready 00:00",
+                    "Active (working…)",
+                    "Preloading into memory…",
+                )
+            )
+            + 4
+        )
         self.lbl_connection.setToolTip(
             "Model stays loaded in RAM/VRAM during a 3-minute inactivity window for instant answers.\n"
             "Automatically unloads after 3m of inactivity to free memory. Window resets on any prompt."
@@ -132,9 +183,24 @@ class ChatTopBar(QWidget):
 
         ctrl_row.addStretch()
 
+        self.btn_inspector_toggle = QToolButton()
+        self.btn_inspector_toggle.setIcon(icon("panel-right", DARK.colors.text_secondary, 16))
+        self.btn_inspector_toggle.setToolTip("Toggle inspector (Ctrl+Shift+B)")
+        self.btn_inspector_toggle.setProperty("variant", "ghost")
+        self.btn_inspector_toggle.setProperty("iconOnly", "true")
+        self.btn_inspector_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_inspector_toggle.clicked.connect(self.inspector_toggle_requested.emit)
+        ctrl_row.addWidget(self.btn_inspector_toggle)
+
         self.lbl_token_meter = QLabel("Tokens: 0 / 8192")
         self.lbl_token_meter.setObjectName("TokenMeter")
         self.lbl_token_meter.setProperty("role", "muted")
+        self.lbl_token_meter.setFixedWidth(
+            QFontMetrics(self.lbl_token_meter.font()).horizontalAdvance(
+                "Tokens: ~999,999 / 999,999"
+            )
+            + 4
+        )
         ctrl_row.addWidget(self.lbl_token_meter)
         main_layout.addLayout(ctrl_row)
 
@@ -143,22 +209,26 @@ class ChatTopBar(QWidget):
         status_layout = QHBoxLayout(self.status_container)
         status_layout.setContentsMargins(0, 2, 0, 2)
         status_layout.setSpacing(8)
+        self.status_container.setFixedHeight(20)
 
         self.lbl_status = QLabel("")
         self.lbl_status.setProperty("role", "muted")
         self._status_icon = QLabel()
-        self._status_spinner = Spinner(16, DARK.colors.text_secondary, parent=self.status_container)
+        self._status_icon.hide()
+        self._status_spinner = StatusIcon(16, DARK.colors.text_secondary, parent=self.status_container)
         self._status_spinner.hide()
         status_layout.addWidget(self._status_spinner)
         status_layout.addWidget(self._status_icon)
         status_layout.addWidget(self.lbl_status)
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedHeight(4)
+        self.progress_bar.setObjectName("ChatStatusProgressBar")
+        self.progress_bar.setFixedHeight(2)
         self.progress_bar.setTextVisible(False)
+        self.progress_bar.hide()
         status_layout.addWidget(self.progress_bar)
 
-        self.status_container.setVisible(False)
+        self.lbl_status.hide()
         main_layout.addWidget(self.status_container)
 
         # 1-second countdown timer for inactivity window (default 3m = 180s, configurable)
@@ -237,7 +307,7 @@ class ChatTopBar(QWidget):
         self._is_connected = False
         self._is_working = False
         self._keep_alive_timer.stop()
-        self.lbl_connection.setText("Standby (loads on prompt)")
+        self.lbl_connection.setText("Standby")
         self._set_connection_icon("message", DARK.colors.text_tertiary)
         self.lbl_connection.setToolTip(
             f"Model will load into memory when a prompt is sent, and remain open for a {self._keep_alive_short()} idle window."
@@ -251,7 +321,7 @@ class ChatTopBar(QWidget):
         if self._seconds_remaining <= 0:
             self._keep_alive_timer.stop()
             self._is_connected = False
-            self.lbl_connection.setText("Standby (loads on prompt)")
+            self.lbl_connection.setText("Standby")
             self._set_connection_icon("message", DARK.colors.text_tertiary)
             set_property(self.lbl_connection, "state", "standby")
             self.connection_expired.emit(self.current_model())
@@ -263,7 +333,7 @@ class ChatTopBar(QWidget):
         s = self._seconds_remaining % 60
         time_str = f"{m:02d}:{s:02d}"
         label = self._keep_alive_short()
-        self.lbl_connection.setText(f"Connected ({label} idle: {time_str})")
+        self.lbl_connection.setText(f"Ready {time_str}")
         self._set_connection_icon("check", DARK.colors.accent)
         self.lbl_connection.setToolTip(
             f"Model is warm in memory. {label} idle window counting down. Automatically pauses when working."
@@ -293,6 +363,12 @@ class ChatTopBar(QWidget):
     def current_model(self) -> str:
         return self.model_combo.currentText().strip()
 
+    def set_artifact_count(self, count: int) -> None:
+        self.artifact_count_badge.setText(str(count))
+        self.artifact_count_badge.setToolTip(
+            f"{count} {'artifact' if count == 1 else 'artifacts'} in this chat"
+        )
+
     def _on_mode_changed(self) -> None:
         m = self.current_mode()
         # Show Depth selector only in Research mode
@@ -316,6 +392,7 @@ class ChatTopBar(QWidget):
         """Force Quick depth when low power mode is active."""
         self._low_power_mode = enabled
         self._status_spinner.set_low_power_mode(enabled)
+        self.lbl_connection_icon.set_low_power_mode(enabled)
         if enabled:
             idx = self.depth_combo.findData("quick")
             if idx >= 0:
@@ -375,6 +452,7 @@ class ChatTopBar(QWidget):
         """Display live progress and status message."""
         clean_text, category = strip_emoji_prefix(text)
         self.lbl_status.setText(clean_text)
+        self.lbl_status.show()
         category_icons = {
             "search": "search",
             "fetch": "external-link",
@@ -391,24 +469,32 @@ class ChatTopBar(QWidget):
         elif getattr(self, "_low_power_mode", False):
             self._status_spinner.hide()
             self._status_icon.setPixmap(
-                icon("loader", DARK.colors.text_secondary, 16).pixmap(16, 16)
+                icon("message", DARK.colors.text_secondary, 16).pixmap(16, 16)
             )
             self._status_icon.show()
         else:
             self._status_icon.hide()
+            self._status_spinner.set_state("loading")
             self._status_spinner.show()
         if progress is None:
             self.progress_bar.setRange(0, 0)
+            self.progress_bar.hide()
         else:
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(max(0, min(100, progress)))
-        self.status_container.setVisible(True)
+            self.progress_bar.show()
 
     def hide_status(self) -> None:
-        self.status_container.setVisible(False)
         self.lbl_status.setText("")
+        self.lbl_status.hide()
         self._status_spinner.hide()
         self._status_icon.hide()
+        self.progress_bar.hide()
 
     def _set_connection_icon(self, name: str, color: str) -> None:
+        if name == "loader":
+            self.lbl_connection_icon.set_color(color)
+            self.lbl_connection_icon.set_state("loading")
+            return
+        self.lbl_connection_icon.set_color(color)
         self.lbl_connection_icon.setPixmap(icon(name, color, 16).pixmap(16, 16))
